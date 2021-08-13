@@ -1,74 +1,89 @@
 package keychain
 
-// #cgo CFLAGS: -mmacosx-version-min=10.13
-// #cgo LDFLAGS: -framework CoreFoundation -framework Security
-// #import <CoreFoundation/CoreFoundation.h>
-// #import <Security/Security.h>
-import "C"
+/*
+#cgo CFLAGS: -x objective-c -mmacosx-version-min=10.13
+#cgo LDFLAGS: -framework Foundation -framework CoreFoundation -framework Security
+#import <Foundation/Foundation.h>
+#import <CoreFoundation/CoreFoundation.h>
+#import <Security/Security.h>
 
+#import "keychain.h"
+*/
+import "C"
 import (
-	"crypto"
-	"fmt"
-	"io"
+	"log"
+	"unsafe"
 )
 
-type Key struct {
-	pub  C.SecKeyRef
-	priv C.SecKeyRef
+func TesterFunction() {
+	var in *C.testIn = new(C.testIn)
+	in.inmessage = C.CString("hello")
+	var out *C.testOut
+
+	C.testFunction(in, &out)
+
+	log.Print(C.GoString(out.outmessage))
+
+	C.free(unsafe.Pointer(out))
 }
 
-func CreateKey() (*Key, error) {
-	// https://developer.apple.com/documentation/security/certificate_key_and_trust_services/keys/generating_new_cryptographic_keys?language=objc
+// type Key struct {
+// 	pub  C.SecKeyRef
+// 	priv C.SecKeyRef
+// }
 
-	opts := map[C.CFTypeRef]C.CFTypeRef{
-		C.CFTypeRef(C.kSecAttrKeyType):       C.CFTypeRef(C.kSecAttrKeyTypeRSA),
-		C.CFTypeRef(C.kSecAttrKeySizeInBits): C.CFTypeRef(int64ToCFNumber(2048)),
-	}
+// func CreateKey() (*Key, error) {
+// 	// https://developer.apple.com/documentation/security/certificate_key_and_trust_services/keys/generating_new_cryptographic_keys?language=objc
 
-	var cfErr C.CFErrorRef
-	pk := C.SecKeyCreateRandomKey(mapToCFDictionary(opts), &cfErr)
+// 	opts := map[C.CFTypeRef]C.CFTypeRef{
+// 		C.CFTypeRef(C.kSecAttrKeyType):       C.CFTypeRef(C.kSecAttrKeyTypeRSA),
+// 		C.CFTypeRef(C.kSecAttrKeySizeInBits): C.CFTypeRef(int64ToCFNumber(2048)),
+// 	}
 
-	if !nilCFErrorRef(cfErr) {
-		// TODO - parse it?
-		return nil, fmt.Errorf("failed")
-	}
+// 	var cfErr C.CFErrorRef
+// 	pk := C.SecKeyCreateRandomKey(mapToCFDictionary(opts), &cfErr)
 
-	return &Key{
-		pub:  C.SecKeyCopyPublicKey(pk),
-		priv: pk,
-	}, nil
-}
+// 	if !nilCFErrorRef(cfErr) {
+// 		// TODO - parse it?
+// 		return nil, fmt.Errorf("failed")
+// 	}
 
-func (k *Key) Public() crypto.PublicKey {
-	return nil
-}
+// 	return &Key{
+// 		pub:  C.SecKeyCopyPublicKey(pk),
+// 		priv: pk,
+// 	}, nil
+// }
 
-func (k *Key) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) (signature []byte, err error) {
-	// https://developer.apple.com/documentation/security/certificate_key_and_trust_services/keys/signing_and_verifying?language=objc#overview
-	cfDigest, err := bytesToCFDataRef(digest)
-	if err != nil {
-		return nil, err
-	}
-	var cfErr C.CFErrorRef
-	csig := C.SecKeyCreateSignature(k.priv, C.kSecKeyAlgorithmECDSASignatureDigestX962SHA256, cfDigest, &cfErr)
-	if !nilCFErrorRef(cfErr) {
-		return nil, fmt.Errorf("signing: %v", cfErrorRefToError(cfErr))
-	}
-	defer C.CFRelease(C.CFTypeRef(csig))
-	return cfDataRefToBytes(csig), nil
-}
+// func (k *Key) Public() crypto.PublicKey {
+// 	return nil
+// }
 
-func (k *Key) Close() {
-	if !nilSecKeyRef(k.pub) {
-		C.CFRelease(C.CFTypeRef(k.pub))
-	}
-	if !nilSecKeyRef(k.priv) {
-		C.CFRelease(C.CFTypeRef(k.priv))
-	}
-}
+// func (k *Key) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) (signature []byte, err error) {
+// 	// https://developer.apple.com/documentation/security/certificate_key_and_trust_services/keys/signing_and_verifying?language=objc#overview
+// 	cfDigest, err := bytesToCFDataRef(digest)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	var cfErr C.CFErrorRef
+// 	csig := C.SecKeyCreateSignature(k.priv, C.kSecKeyAlgorithmECDSASignatureDigestX962SHA256, cfDigest, &cfErr)
+// 	if !nilCFErrorRef(cfErr) {
+// 		return nil, fmt.Errorf("signing: %v", cfErrorRefToError(cfErr))
+// 	}
+// 	defer C.CFRelease(C.CFTypeRef(csig))
+// 	return cfDataRefToBytes(csig), nil
+// }
 
-func nilSecKeyRef(r C.SecKeyRef) bool {
-	return r == 0
-}
+// func (k *Key) Close() {
+// 	if !nilSecKeyRef(k.pub) {
+// 		C.CFRelease(C.CFTypeRef(k.pub))
+// 	}
+// 	if !nilSecKeyRef(k.priv) {
+// 		C.CFRelease(C.CFTypeRef(k.priv))
+// 	}
+// }
 
-var _ crypto.Signer = (*Key)(nil)
+// func nilSecKeyRef(r C.SecKeyRef) bool {
+// 	return r == 0
+// }
+
+// var _ crypto.Signer = (*Key)(nil)
