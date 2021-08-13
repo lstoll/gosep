@@ -1,0 +1,2 @@
+*.app/Contents/_CodeSignature/*
+*.app/Contents/MacOS

@@ -11,11 +11,17 @@ package keychain
 */
 import "C"
 import (
-	"log"
+	"errors"
+	"fmt"
 	"unsafe"
 )
 
-func TesterFunction() {
+var (
+	ErrMissingEntitlement = errors.New("application missing necessary entitlements for keychain access")
+	ErrKeyNotFound        = errors.New("key not found")
+)
+
+func CreateKey() error {
 	// var in = new(C.createKeyIn)
 	// in.inmessage = C.CString("hello")
 	var out *C.createKeyOut
@@ -28,12 +34,45 @@ func TesterFunction() {
 
 	C.createKey(in, &out, &cErr)
 	if cErr != nil {
-		log.Printf("error occured: %v", C.GoString(cErr.message))
-		C.free(unsafe.Pointer(cErr))
-		return
+		defer C.free(unsafe.Pointer(cErr))
+		if cErr.code == C.errSecMissingEntitlement {
+			return ErrMissingEntitlement
+		}
+		// TODO - handle -34018 more informatively (missing entitlement)
+		return fmt.Errorf(C.GoString(cErr.message))
+	}
+	if out == nil {
+		return fmt.Errorf("no return")
+	}
+	defer C.free(unsafe.Pointer(out))
+
+	return nil
+}
+
+func GetKey() error {
+	// var in = new(C.createKeyIn)
+	// in.inmessage = C.CString("hello")
+	var out *C.getKeyOut
+	var cErr *C.error
+
+	in := &C.getKeyIn{
+		tag: C.CString("li.lds.osxsecure.testkey1"),
 	}
 
-	C.free(unsafe.Pointer(out))
+	C.getKey(in, &out, &cErr)
+	if cErr != nil {
+		defer C.free(unsafe.Pointer(cErr))
+		if cErr.code == C.errSecItemNotFound {
+			return ErrKeyNotFound
+		}
+		return fmt.Errorf(C.GoString(cErr.message))
+	}
+	if out == nil {
+		return fmt.Errorf("no return")
+	}
+	defer C.free(unsafe.Pointer(out))
+
+	return nil
 }
 
 // type Key struct {

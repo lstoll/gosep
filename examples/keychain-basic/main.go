@@ -1,6 +1,8 @@
 package main
 
 import (
+	"log"
+
 	"github.com/lstoll/osxsecure/keychain"
 )
 
@@ -12,5 +14,11 @@ func main() {
 	// k.Close()
 	// log.Print("done")
 
-	keychain.TesterFunction()
+	// if err := keychain.CreateKey(); err != nil {
+	// 	log.Fatalf("create key failed: %v", err)
+	// }
+	if err := keychain.GetKey(); err != nil {
+		log.Fatalf("get key failed: %v", err)
+	}
+	log.Print("done")
 }
