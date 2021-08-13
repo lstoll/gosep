@@ -1,10 +1,17 @@
+#import <CoreFoundation/CoreFoundation.h>
+#import <Security/Security.h>
 
 typedef struct {
-    const char *inmessage;
-} testIn;
+    const char *message;
+} error;
 
 typedef struct {
-    const char *outmessage;
-} testOut;
+    const char *tag;
+    CFStringRef protection;
+} createKeyIn;
 
-void testFunction(testIn *in, testOut **out);
+typedef struct {
+    SecKeyRef privateKey;
+} createKeyOut;
+
+void createKey(createKeyIn *in, createKeyOut **out, error **err);

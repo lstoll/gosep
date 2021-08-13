@@ -16,13 +16,22 @@ import (
 )
 
 func TesterFunction() {
-	var in *C.testIn = new(C.testIn)
-	in.inmessage = C.CString("hello")
-	var out *C.testOut
+	// var in = new(C.createKeyIn)
+	// in.inmessage = C.CString("hello")
+	var out *C.createKeyOut
+	var cErr *C.error
 
-	C.testFunction(in, &out)
+	in := &C.createKeyIn{
+		tag:        C.CString("li.lds.osxsecure.testkey1"),
+		protection: C.kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+	}
 
-	log.Print(C.GoString(out.outmessage))
+	C.createKey(in, &out, &cErr)
+	if cErr != nil {
+		log.Printf("error occured: %v", C.GoString(cErr.message))
+		C.free(unsafe.Pointer(cErr))
+		return
+	}
 
 	C.free(unsafe.Pointer(out))
 }
