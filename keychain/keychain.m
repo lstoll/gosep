@@ -132,3 +132,33 @@ void publicKey(SecKeyRef priv, size_t *size, const char **buf, error **err) {
     *buf = b;
     *size = len;
 }
+
+void sign(SecKeyRef priv, const void *indata, size_t insize, const char **outdata, size_t *outSize, error **err) {
+    NSData* data = [NSData dataWithBytes:indata length:insize];
+
+    // TODO check:
+    // BOOL canSign = SecKeyIsAlgorithmSupported(privateKey,
+    //                                      kSecKeyOperationTypeSign,
+    //
+
+    CFErrorRef cfError = NULL;
+    NSData *signature = (NSData*)CFBridgingRelease(       // ARC takes ownership
+                     SecKeyCreateSignature(priv,
+                                            kSecKeyAlgorithmECDSASignatureDigestX962SHA256,
+                                           (__bridge CFDataRef)data,
+                                           &cfError));
+    if (!signature) {
+        NSError *nerr = CFBridgingRelease(cfError);  // ARC takes ownership
+        error *e = malloc(sizeof(*err));
+        e->message = [[nerr localizedDescription] UTF8String];
+        e->code = (int) [nerr code];
+        *err = e;
+        return;
+    }
+
+    NSUInteger len = [signature length];
+    void *b = malloc(len);
+    memcpy(b, [signature bytes], len);
+    *outdata = b;
+    *outSize = len;
+}

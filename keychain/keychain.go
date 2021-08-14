@@ -18,6 +18,7 @@ import (
 	"crypto/elliptic"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"runtime"
 	"unsafe"
@@ -32,6 +33,26 @@ var (
 type Key struct {
 	priv C.SecKeyRef
 	pub  *ecdsa.PublicKey
+}
+
+func (k Key) Sign(_ io.Reader, digest []byte, _ crypto.SignerOpts) ([]byte, error) {
+	var (
+		size C.size_t
+		buf  *C.char
+		cErr *C.error
+	)
+
+	C.sign(k.priv, unsafe.Pointer(&digest[0]), C.size_t(len(digest)), &buf, &size, &cErr)
+	if cErr != nil {
+		defer C.free(unsafe.Pointer(cErr))
+		return nil, fmt.Errorf(C.GoString(cErr.message))
+	}
+	if buf == nil {
+		return nil, fmt.Errorf("no return")
+	}
+	defer C.free(unsafe.Pointer(buf))
+
+	return C.GoBytes(unsafe.Pointer(buf), C.int(size)), nil
 }
 
 func (k *Key) Public() crypto.PublicKey {
