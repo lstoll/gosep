@@ -1,3 +1,3 @@
-module github.com/lstoll/osxsecure
+module github.com/lstoll/gosep
 
 go 1.16

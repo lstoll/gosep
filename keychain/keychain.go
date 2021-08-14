@@ -1,7 +1,7 @@
 package keychain
 
 /*
-#cgo CFLAGS: -x objective-c -mmacosx-version-min=10.13
+#cgo CFLAGS: -x objective-c -mmacosx-version-min=10.13 -fobjc-arc
 #cgo LDFLAGS: -framework Foundation -framework CoreFoundation -framework Security
 #import <Foundation/Foundation.h>
 #import <CoreFoundation/CoreFoundation.h>
@@ -13,22 +13,36 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"unsafe"
 )
 
 var (
 	ErrMissingEntitlement = errors.New("application missing necessary entitlements for keychain access")
 	ErrKeyNotFound        = errors.New("key not found")
+	ErrKeyAlreadyExists   = errors.New("key with given tag already exists")
 )
 
-func CreateKey() error {
+type Key struct {
+	priv C.SecKeyRef
+}
+
+func CreateKey(tag string) (*Key, error) {
+	k, err := GetKey(tag)
+	if err != nil && err != ErrKeyNotFound {
+		return nil, err
+	}
+	if k != nil {
+		return nil, ErrKeyAlreadyExists
+	}
+
 	// var in = new(C.createKeyIn)
 	// in.inmessage = C.CString("hello")
 	var out *C.createKeyOut
 	var cErr *C.error
 
 	in := &C.createKeyIn{
-		tag:        C.CString("li.lds.osxsecure.testkey1"),
+		tag:        C.CString("li.lds.gosep.testkey1"),
 		protection: C.kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
 	}
 
@@ -36,43 +50,84 @@ func CreateKey() error {
 	if cErr != nil {
 		defer C.free(unsafe.Pointer(cErr))
 		if cErr.code == C.errSecMissingEntitlement {
-			return ErrMissingEntitlement
+			return nil, ErrMissingEntitlement
 		}
 		// TODO - handle -34018 more informatively (missing entitlement)
-		return fmt.Errorf(C.GoString(cErr.message))
+		return nil, fmt.Errorf(C.GoString(cErr.message))
 	}
 	if out == nil {
-		return fmt.Errorf("no return")
+		return nil, fmt.Errorf("no return")
 	}
 	defer C.free(unsafe.Pointer(out))
 
-	return nil
+	k = &Key{
+		priv: out.privateKey,
+	}
+	runtime.SetFinalizer(k, freeKey)
+
+	return k, nil
 }
 
-func GetKey() error {
-	// var in = new(C.createKeyIn)
-	// in.inmessage = C.CString("hello")
-	var out *C.getKeyOut
-	var cErr *C.error
+func GetKey(tag string) (*Key, error) {
+	var (
+		out  *C.getKeyOut
+		cErr *C.error
+	)
 
 	in := &C.getKeyIn{
-		tag: C.CString("li.lds.osxsecure.testkey1"),
+		tag: C.CString(tag),
 	}
 
 	C.getKey(in, &out, &cErr)
 	if cErr != nil {
 		defer C.free(unsafe.Pointer(cErr))
 		if cErr.code == C.errSecItemNotFound {
-			return ErrKeyNotFound
+			return nil, ErrKeyNotFound
 		}
-		return fmt.Errorf(C.GoString(cErr.message))
+		return nil, fmt.Errorf(C.GoString(cErr.message))
 	}
 	if out == nil {
-		return fmt.Errorf("no return")
+		return nil, fmt.Errorf("no error, but not return")
 	}
 	defer C.free(unsafe.Pointer(out))
 
+	k := &Key{
+		priv: out.privateKey,
+	}
+	runtime.SetFinalizer(k, freeKey)
+
+	return k, nil
+}
+
+func ListKeys() error {
+	C.listKeys()
 	return nil
+}
+
+func DeleteKey(tag string) error {
+	var (
+		cErr *C.error
+	)
+
+	in := &C.getKeyIn{
+		tag: C.CString(tag),
+	}
+
+	C.deleteKey(in, &cErr)
+	if cErr != nil {
+		defer C.free(unsafe.Pointer(cErr))
+		if cErr.code == C.errSecItemNotFound {
+			return ErrKeyNotFound
+		}
+		return fmt.Errorf("deleting key: %v", C.GoString(cErr.message))
+	}
+	return nil
+}
+
+var freeKey = func(k *Key) {
+	if k.priv != 0 {
+		C.CFRelease(C.CFTypeRef(k.priv))
+	}
 }
 
 // type Key struct {

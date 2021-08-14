@@ -26,3 +26,7 @@ typedef struct {
 } getKeyOut;
 
 void getKey(getKeyIn *in, getKeyOut **out, error **err);
+
+void listKeys();
+
+void deleteKey(getKeyIn *in, error **err);
