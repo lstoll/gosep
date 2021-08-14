@@ -53,7 +53,7 @@ func CreateKey(tag string) (*Key, error) {
 	var cErr *C.error
 
 	in := &C.createKeyIn{
-		tag:        C.CString("li.lds.gosep.testkey1"),
+		tag:        C.CString(tag),
 		protection: C.kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
 	}
 

@@ -19,16 +19,24 @@ func main() {
 	// log.Print("done")
 
 	const tag = "li.lds.gosep.testkey1"
+	// const tag = "li.lds.osxsecure.testkey1"
 
 	if _, err := keychain.CreateKey(tag); err != nil {
 		log.Printf("create key failed: %v", err)
+	} else {
+		log.Print("create worked")
 	}
-	log.Print("create worked")
+	if _, err := keychain.CreateKey(tag); err != nil {
+		log.Printf("subsequent create key failed: %v", err)
+	} else {
+		log.Print("subsequent create worked")
+	}
 	k, err := keychain.GetKey(tag)
 	if err != nil {
 		log.Fatalf("get key failed: %v", err)
+	} else {
+		log.Print("get worked")
 	}
-	log.Print("get worked")
 
 	pub := k.Public().(*ecdsa.PublicKey)
 
@@ -42,6 +50,8 @@ func main() {
 
 	if err := keychain.DeleteKey(tag); err != nil {
 		log.Fatalf("delete key failed: %v", err)
+	} else {
+		log.Print("delete worked")
 	}
 	log.Print("done")
 }
