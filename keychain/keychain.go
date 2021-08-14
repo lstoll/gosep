@@ -6,13 +6,19 @@ package keychain
 #import <Foundation/Foundation.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <Security/Security.h>
+#import <stdlib.h>
 
 #import "keychain.h"
 */
 import "C"
 import (
+	"bytes"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"errors"
 	"fmt"
+	"math/big"
 	"runtime"
 	"unsafe"
 )
@@ -25,6 +31,11 @@ var (
 
 type Key struct {
 	priv C.SecKeyRef
+	pub  *ecdsa.PublicKey
+}
+
+func (k *Key) Public() crypto.PublicKey {
+	return k.pub
 }
 
 func CreateKey(tag string) (*Key, error) {
@@ -65,6 +76,10 @@ func CreateKey(tag string) (*Key, error) {
 	}
 	runtime.SetFinalizer(k, freeKey)
 
+	if err := k.setPublic(); err != nil {
+		return nil, err
+	}
+
 	return k, nil
 }
 
@@ -96,6 +111,10 @@ func GetKey(tag string) (*Key, error) {
 	}
 	runtime.SetFinalizer(k, freeKey)
 
+	if err := k.setPublic(); err != nil {
+		return nil, err
+	}
+
 	return k, nil
 }
 
@@ -123,6 +142,41 @@ var freeKey = func(k *Key) {
 	if k.priv != 0 {
 		C.CFRelease(C.CFTypeRef(k.priv))
 	}
+
+}
+
+func (k *Key) setPublic() error {
+	var (
+		size C.size_t
+		buf  *C.char
+		cErr *C.error
+	)
+
+	C.publicKey(k.priv, &size, &buf, &cErr)
+	if cErr != nil {
+		defer C.free(unsafe.Pointer(cErr))
+		if cErr.code == C.errSecItemNotFound {
+			return ErrKeyNotFound
+		}
+		return fmt.Errorf("populating public key: %v", C.GoString(cErr.message))
+	}
+	defer C.free(unsafe.Pointer(buf))
+
+	pb := C.GoBytes(unsafe.Pointer(buf), C.int(size))
+
+	if !bytes.HasPrefix(pb, []byte{0x04}) {
+		return fmt.Errorf("bad key format")
+	}
+	if len(pb) != 65 {
+		return fmt.Errorf("wanted public key data len 65, got: %d", len(pb))
+	}
+	k.pub = &ecdsa.PublicKey{
+		Curve: elliptic.P256(),
+		X:     big.NewInt(0).SetBytes(pb[1:33]),
+		Y:     big.NewInt(0).SetBytes(pb[33:]),
+	}
+
+	return nil
 }
 
 // type Key struct {

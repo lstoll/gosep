@@ -109,3 +109,26 @@ void deleteKey(getKeyIn *in, error **err) {
         return;
     }
 }
+
+void publicKey(SecKeyRef priv, size_t *size, const char **buf, error **err) {
+    SecKeyRef publicKey = SecKeyCopyPublicKey(priv);
+
+    CFErrorRef cfError = NULL;
+    NSData* keyData = (NSData*)CFBridgingRelease(  // ARC takes ownership
+                        SecKeyCopyExternalRepresentation(publicKey, &cfError)
+                   );
+    if (!keyData) {
+        NSError *nerr = CFBridgingRelease(cfError);  // ARC takes ownership
+        error *e = malloc(sizeof(*err));
+        e->message = [[nerr localizedDescription] UTF8String];
+        e->code = (int) [nerr code];
+        *err = e;
+        return;
+    }
+
+    NSUInteger len = [keyData length];
+    void *b = malloc(len);
+    memcpy(b, [keyData bytes], len);
+    *buf = b;
+    *size = len;
+}

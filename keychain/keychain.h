@@ -30,3 +30,5 @@ void getKey(getKeyIn *in, getKeyOut **out, error **err);
 void listKeys();
 
 void deleteKey(getKeyIn *in, error **err);
+
+void publicKey(SecKeyRef priv, size_t *size, const char **buf, error **err);
