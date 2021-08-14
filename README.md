@@ -41,6 +41,9 @@ Entitlements for SEP (Team ID is after name in identity list) e.g:
 ```
 
 A provisioning profile is also required, as restricted entitlements are needed:
+* Go to https://developer.apple.com/account/resources/identifiers/add/bundleId
+* Add an identifier for this app.
+* For apps using attest, that capability will need to be added explicitly.
 * Go to https://developer.apple.com/account/resources/profiles/add
 * Create a new provisioning profile of type Developer ID Application
 * Bind to the cert from above
