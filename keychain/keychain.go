@@ -99,11 +99,6 @@ func GetKey(tag string) (*Key, error) {
 	return k, nil
 }
 
-func ListKeys() error {
-	C.listKeys()
-	return nil
-}
-
 func DeleteKey(tag string) error {
 	var (
 		cErr *C.error
