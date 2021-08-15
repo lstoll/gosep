@@ -53,3 +53,9 @@ Sign with identity
 ```
 codesign --force --identifier com.domain.app --deep --entitlements entitlements.plist --sign <id> <bundle root folder>
 ```
+
+Browse profile contents:
+
+```
+security cms -D -i bundled/attested-app.app/Contents/embedded.provisionprofile
+```

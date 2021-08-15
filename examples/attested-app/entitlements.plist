@@ -3,12 +3,12 @@
 <plist version="1.0">
 <dict>
         <key>com.apple.application-identifier</key>
-        <string>MZXW569JYG.li.lds.gosep.attestexample</string>
+        <string>MZXW569JYG.li.lds.gosep.attested-app</string>
         <key>com.apple.developer.team-identifier</key>
         <string>MZXW569JYG</string>
         <key>keychain-access-groups</key>
         <array>
-                <string>MZXW569JYG.li.lds.gosep.attestexample</string>
+                <string>MZXW569JYG.li.lds.gosep.attested-app</string>
         </array>
         <key>com.apple.developer.devicecheck.appattest-environment</key>
         <string>development</string>

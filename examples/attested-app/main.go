@@ -1,7 +1,11 @@
 package main
 
-import "github.com/lstoll/gosep/appattest"
+import (
+	"log"
+
+	"github.com/lstoll/gosep/appattest"
+)
 
 func main() {
-	appattest.TestOne()
+	log.Printf("supported: %t", appattest.Supported())
 }
