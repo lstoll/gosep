@@ -62,7 +62,7 @@ void getKey(getKeyIn *in, getKeyOut **out, error **err) {
     *out = o;
 }
 
-void listKeys() {
+void listKeys(void) {
     // TODO - what would a list function actually look like, and what would be
     // the best data type to return?
     NSDictionary *query = @{ (__bridge id)kSecClass: (__bridge id)kSecClassKey,
