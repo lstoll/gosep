@@ -373,9 +373,11 @@ func min(a, b int) int {
 	return b
 }
 
-// KeychainIdentityInfo holds information about a keychain identity.
+// KeychainIdentityInfo holds information about a keychain identity suitable for mTLS.
 type KeychainIdentityInfo struct {
-	Label string // Usually the Common Name or Subject Summary from the certificate
+	Label       string            // The kSecAttrLabel used to provision the key/cert.
+	Certificate *x509.Certificate // The parsed client certificate.
+	Signer      crypto.Signer     // A crypto.Signer using the Secure Enclave key.
 }
 
 // ListKeychainIdentities retrieves information about all identities (certificate + private key)
@@ -408,15 +410,49 @@ func ListKeychainIdentities() ([]KeychainIdentityInfo, error) {
 	cIdentityInfoSlice := (*[1 << 30]C.KeychainIdentityInfo)(unsafe.Pointer(cIdentityInfos))[:cCount:cCount]
 
 	for i := 0; i < int(cCount); i++ {
+		ci := cIdentityInfoSlice[i]
 		info := KeychainIdentityInfo{}
-		if cIdentityInfoSlice[i].label != nil {
-			// Copy the C string to a Go string
-			info.Label = C.GoString(cIdentityInfoSlice[i].label)
-		} else {
-			// Handle case where label might be unexpectedly nil from C side
-			info.Label = "<Unknown Label>"
-			log.Printf("Warning: Keychain identity at index %d has nil label from C", i)
+
+		// 1. Get the Label
+		if ci.label == nil {
+			log.Printf("Warning: Keychain identity at index %d has nil label from C, skipping.", i)
+			continue
 		}
+		info.Label = C.GoString(ci.label)
+
+		// 2. Get and Parse the Certificate
+		if ci.certificateDER == nil || ci.certificateDERLength == 0 {
+			log.Printf("Warning: Keychain identity '%s' (index %d) has nil/empty certificate DER from C, skipping.", info.Label, i)
+			continue
+		}
+		certDER := C.GoBytes(unsafe.Pointer(ci.certificateDER), C.int(ci.certificateDERLength))
+		parsedCert, err := x509.ParseCertificate(certDER)
+		if err != nil {
+			log.Printf("Warning: Failed to parse certificate DER for identity '%s' (index %d): %v, skipping.", info.Label, i, err)
+			continue
+		}
+		info.Certificate = parsedCert
+
+		// 3. Create the Signer
+		// Extract the public key from the certificate.
+		// We assume it's ECDSA P-256, consistent with key generation.
+		ecdsaPubKey, ok := parsedCert.PublicKey.(*ecdsa.PublicKey)
+		if !ok || ecdsaPubKey.Curve.Params().Name != elliptic.P256().Params().Name {
+			log.Printf("Warning: Certificate for identity '%s' (index %d) does not contain a P-256 ECDSA public key, skipping.", info.Label, i)
+			continue
+		}
+
+		// Create the SecureEnclaveSigner using the label and the public key from the cert.
+		seSigner, err := NewSecureEnclaveSigner(info.Label, ecdsaPubKey)
+		if err != nil {
+			// This shouldn't typically fail if the label is correct and pubkey is provided,
+			// but handle defensively.
+			log.Printf("Warning: Failed to create SecureEnclaveSigner for identity '%s' (index %d): %v, skipping.", info.Label, i, err)
+			continue
+		}
+		info.Signer = seSigner
+
+		// If all steps succeeded, add to the results
 		goIdentityInfos = append(goIdentityInfos, info)
 	}
 

@@ -242,7 +242,7 @@ int ProvisionIdentityWithCertificate(const char *keyLabel,
         (id)kSecClass: (id)kSecClassCertificate,
         (id)kSecValueRef: (__bridge id)certificate, // Bridge, transfer ownership later IF SecItemAdd succeeds
         (id)kSecAttrLabel: nsLabel,
-        //(id)kSecAttrApplicationTag: tag, //  Doesn't seem to work with kSecUseDataProtectionKeychain
+        // (id)kSecAttrApplicationTag: tag, //  Doesn't seem to work with kSecUseDataProtectionKeychain
         //(id)kSecAttrIsPermanent: @YES,
         //(id)kSecAttrAccessible: (id)kSecAttrAccessibleWhenUnlockedThisDeviceOnly, // Match SE key accessibility
         (id)kSecUseDataProtectionKeychain: @YES // Explicitly use data protection keychain
@@ -566,10 +566,11 @@ int ListKeychainIdentities(KeychainIdentityInfo** outIdentityInfos, int* outCoun
     *outIdentityInfos = NULL;
     *outCount = 0;
 
-    // Query for Identity items
+    // Query for Identity items, returning attributes and the ref
     NSDictionary *query = @{
         (id)kSecClass: (id)kSecClassIdentity,
         (id)kSecReturnRef: @YES,          // Return SecIdentityRef objects
+        (id)kSecReturnAttributes: @YES,   // Return attributes dictionary too
         (id)kSecMatchLimit: (id)kSecMatchLimitAll, // Get all matching items
         (id)kSecUseDataProtectionKeychain: @YES // Query within the data protection keychain
     };
@@ -606,53 +607,85 @@ int ListKeychainIdentities(KeychainIdentityInfo** outIdentityInfos, int* outCoun
 
     int actualCount = 0;
     for (CFIndex i = 0; i < count; ++i) {
-        SecIdentityRef identityRef = (SecIdentityRef)CFArrayGetValueAtIndex(results, i);
+        CFDictionaryRef itemDict = (CFDictionaryRef)CFArrayGetValueAtIndex(results, i);
+        if (!itemDict || CFGetTypeID(itemDict) != CFDictionaryGetTypeID()) {
+            NSLog(@"[SE Identity] Warning: Skipping non-dictionary item in keychain results (index %ld).", i);
+            continue;
+        }
+
+        // Extract the Identity Reference
+        SecIdentityRef identityRef = (SecIdentityRef)CFDictionaryGetValue(itemDict, kSecValueRef);
         if (!identityRef || CFGetTypeID(identityRef) != SecIdentityGetTypeID()) {
-             NSLog(@"[SE Identity] Warning: Skipping invalid item in keychain results (index %ld).", i);
-            continue; // Skip non-identity items
+             NSLog(@"[SE Identity] Warning: Skipping item without valid SecIdentityRef (index %ld).", i);
+            continue; // Skip if we don't have an identity ref
+        }
+
+        // Extract the Label (kSecAttrLabel)
+        CFStringRef labelRef = (CFStringRef)CFDictionaryGetValue(itemDict, kSecAttrLabel);
+        char *labelCopy = NULL;
+        if (labelRef && CFGetTypeID(labelRef) == CFStringGetTypeID()) {
+            const char *labelCStr = CFStringGetCStringPtr(labelRef, kCFStringEncodingUTF8);
+            if (labelCStr) {
+                size_t len = strlen(labelCStr) + 1;
+                labelCopy = (char *)malloc(len);
+                if (labelCopy) memcpy(labelCopy, labelCStr, len);
+            } else {
+                CFIndex bufferSize = CFStringGetMaximumSizeForEncoding(CFStringGetLength(labelRef), kCFStringEncodingUTF8) + 1;
+                labelCopy = (char *)malloc(bufferSize);
+                if (!(labelCopy && CFStringGetCString(labelRef, labelCopy, bufferSize, kCFStringEncodingUTF8))) {
+                    if (labelCopy) free(labelCopy); labelCopy = NULL;
+                }
+            }
+        }
+        if (!labelCopy) {
+             NSLog(@"[SE Identity] Warning: Found identity (index %ld) without a valid kSecAttrLabel, skipping.", i);
+             continue; // Skip if we couldn't get the label we need for the signer
         }
 
         // Get the certificate associated with the identity
         SecCertificateRef certificateRef = NULL;
         status = SecIdentityCopyCertificate(identityRef, &certificateRef);
         if (status != errSecSuccess || !certificateRef) {
-            NSLog(@"[SE Identity] Warning: Could not get certificate for identity at index %ld. Status: %d. Skipping.", i, (int)status);
+            NSLog(@"[SE Identity] Warning: Could not get certificate for identity with label '%s' (index %ld). Status: %d. Skipping.", labelCopy, i, (int)status);
             if (certificateRef) CFRelease(certificateRef);
+            free(labelCopy); // Free the label we copied
             continue;
         }
 
-        // Get a displayable name/label (Common Name or Subject Summary)
-        CFStringRef summaryRef = SecCertificateCopySubjectSummary(certificateRef);
+        // Get the certificate's DER data
+        CFDataRef certDataRef = SecCertificateCopyData(certificateRef);
         CFRelease(certificateRef); // Release cert ref obtained from SecIdentityCopyCertificate
 
-        char *labelCopy = NULL;
-        if (summaryRef) {
-            const char *labelCStr = CFStringGetCStringPtr(summaryRef, kCFStringEncodingUTF8);
-            if (labelCStr) {
-                size_t len = strlen(labelCStr) + 1;
-                labelCopy = (char *)malloc(len);
-                if (labelCopy) memcpy(labelCopy, labelCStr, len);
-            } else {
-                CFIndex bufferSize = CFStringGetMaximumSizeForEncoding(CFStringGetLength(summaryRef), kCFStringEncodingUTF8) + 1;
-                labelCopy = (char *)malloc(bufferSize);
-                if (!(labelCopy && CFStringGetCString(summaryRef, labelCopy, bufferSize, kCFStringEncodingUTF8))) {
-                    if (labelCopy) free(labelCopy); labelCopy = NULL;
+        unsigned char *certDERCopy = NULL;
+        size_t certDERLength = 0;
+        if (certDataRef) {
+            certDERLength = CFDataGetLength(certDataRef);
+            if (certDERLength > 0) {
+                certDERCopy = (unsigned char *)malloc(certDERLength);
+                if (certDERCopy) {
+                    memcpy(certDERCopy, CFDataGetBytePtr(certDataRef), certDERLength);
+                } else {
+                     NSLog(@"[SE Identity] Warning: Failed to allocate memory for certificate DER for label '%s', skipping.", labelCopy);
+                     certDERLength = 0; // Reset length if allocation failed
                 }
             }
-            CFRelease(summaryRef);
+            CFRelease(certDataRef);
         }
 
-        if (!labelCopy) {
-             NSLog(@"[SE Identity] Warning: Found identity (index %ld) without a valid label/summary or failed allocation/conversion, skipping.", i);
-             continue; // Skip if we couldn't get a usable label
+        if (!certDERCopy) {
+             NSLog(@"[SE Identity] Warning: Could not get certificate DER data for label '%s' (index %ld), skipping.", labelCopy, i);
+             free(labelCopy); // Free the label we copied
+             continue; // Skip if we couldn't get cert data
         }
 
-        // Store the copied label
-        identityInfos[actualCount].label = labelCopy; // Ownership transferred
+        // Store the copied label and certificate DER
+        identityInfos[actualCount].label = labelCopy;             // Ownership transferred
+        identityInfos[actualCount].certificateDER = certDERCopy; // Ownership transferred
+        identityInfos[actualCount].certificateDERLength = certDERLength;
         actualCount++;
     }
 
-    CFRelease(results); // Release the array of SecIdentityRef
+    CFRelease(results); // Release the results array
 
     if (actualCount == 0 && count > 0) {
          NSLog(@"[SE Identity] Warning: Queried %ld identities, but none had valid labels suitable for return.", count);
@@ -680,6 +713,9 @@ void FreeKeychainIdentityInfoList(KeychainIdentityInfo *identityInfos, int count
     for (int i = 0; i < count; ++i) {
         if (identityInfos[i].label) {
             free(identityInfos[i].label); // Free the C string label
+        }
+        if (identityInfos[i].certificateDER) {
+            free(identityInfos[i].certificateDER); // Free the certificate DER data
         }
         // Free other fields if added to the struct
     }

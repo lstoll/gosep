@@ -80,8 +80,9 @@ typedef struct {
 
 // Struct to hold information about a Keychain Identity
 typedef struct {
-    char* label; // Typically the Common Name from the certificate (caller must free)
-    // Add other fields if needed, e.g., persistent ref, issuer, etc.
+    char* label; // The kSecAttrLabel associated with the key/cert (caller must free)
+    unsigned char* certificateDER; // DER-encoded certificate data (caller must free)
+    size_t certificateDERLength;   // Length of certificateDER
 } KeychainIdentityInfo;
 
 /**

@@ -17,6 +17,7 @@ var cli struct {
 	ProvisionIdentity ProvisionIdentityCmd `cmd:"" help:"Provision a new identity in the Secure Enclave and Keychain."`
 	ListIdentities    ListIdentitiesCmd    `cmd:"" help:"List identities stored in the Keychain."`
 	ListKeys          ListKeysCmd          `cmd:"" help:"List keys stored in the Secure Enclave."`
+	MTLSConnect       MTLSConnectCmd       `cmd:"" help:"Connect to a remote host using mTLS with a keychain identity."`
 }
 
 // --- Main Function ---
