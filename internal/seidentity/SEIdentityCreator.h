@@ -1,0 +1,77 @@
+#ifndef SEIdentityCreator_h
+#define SEIdentityCreator_h
+
+#import <Foundation/Foundation.h>
+#import <Security/Security.h>
+#import <LocalAuthentication/LocalAuthentication.h> // For LAContext
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Error codes
+#define SE_SUCCESS 0
+#define SE_ERR_ACCESS_CONTROL -1
+#define SE_ERR_KEY_GENERATION -2
+#define SE_ERR_KEY_QUERY_FAILED -3
+#define SE_ERR_KEY_NOT_FOUND -4
+#define SE_ERR_PUBKEY_EXPORT -5
+#define SE_ERR_SIGNATURE_FAILED -6
+#define SE_ERR_CERT_CREATE_FAILED -7
+#define SE_ERR_CERT_ADD_FAILED -8
+#define SE_ERR_INVALID_INPUT -9
+#define SE_ERR_AUTH_FAILED -10 // User failed/cancelled biometric auth
+#define SE_ERR_UNKNOWN -99
+
+/**
+ * Generates a new EC P-256 key pair within the Secure Enclave.
+ * The private key requires biometric authentication (Touch ID/Face ID) for use.
+ *
+ * @param keyLabel A unique label (C string) to identify this key pair in the Keychain.
+ * @param outPublicKeyDER A pointer to a buffer where the DER-encoded public key will be written.
+ * The caller must free this buffer using free().
+ * @param outPublicKeyLength A pointer to store the length of the public key DER data.
+ * @return SE_SUCCESS on success, or a negative SE_ERR_* code on failure.
+ */
+int GenerateSEKeyPairAndGetPublicKey(const char *keyLabel,
+                                     unsigned char **outPublicKeyDER,
+                                     size_t *outPublicKeyLength);
+
+/**
+ * Signs the provided data using the Secure Enclave private key identified by keyLabel.
+ * This operation will likely trigger a biometric prompt for the user.
+ *
+ * @param keyLabel The label (C string) of the private key to use for signing.
+ * @param dataToSign A buffer containing the data to be signed.
+ * @param dataToSignLength The length of the data in dataToSign.
+ * @param outSignature A pointer to a buffer where the signature data (ASN.1 encoded for ECDSA) will be written.
+ * The caller must free this buffer using free().
+ * @param outSignatureLength A pointer to store the length of the signature data.
+ * @return SE_SUCCESS on success, or a negative SE_ERR_* code on failure (e.g., key not found, user cancellation).
+ */
+int SignDataWithSEKey(const char *keyLabel,
+                      const unsigned char *dataToSign,
+                      size_t dataToSignLength,
+                      unsigned char **outSignature,
+                      size_t *outSignatureLength);
+
+
+/**
+ * Imports a DER-encoded certificate into the Keychain and associates it with the
+ * Secure Enclave private key identified by keyLabel, creating a SecIdentity.
+ *
+ * @param keyLabel The label (C string) of the private key to associate the certificate with.
+ * @param certificateDER A buffer containing the DER-encoded certificate.
+ * @param certificateDERLength The length of the certificate data.
+ * @return SE_SUCCESS on success, or a negative SE_ERR_* code on failure.
+ */
+int ProvisionIdentityWithCertificate(const char *keyLabel,
+                                     const unsigned char *certificateDER,
+                                     size_t certificateDERLength);
+
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
+
+#endif /* SEIdentityCreator_h */
