@@ -1,4 +1,5 @@
 #import "SEIdentityCreator.h"
+#import <CommonCrypto/CommonDigest.h> // Needed for SHA1 hash
 
 // Helper function to convert CFErrorRef to NSError
 static NSError* CFErrorToNSError(CFErrorRef cfError) {
@@ -13,9 +14,10 @@ static SecAccessControlRef CreateBiometricAccessControl(CFErrorRef *error) {
     // kSecAccessControlPrivateKeyUsage allows signing/decryption operations.
     // kSecAccessControlBiometryCurrentSet requires Touch ID/Face ID enrolled on the device.
     // Other options include kSecAccessControlUserPresence, kSecAccessControlBiometryAny, kSecAccessControlDevicePasscode
+    // LET'S SIMPLIFY: Remove explicit usage control for now. Default might be sufficient for identity recognition.
     return SecAccessControlCreateWithFlags(kCFAllocatorDefault,
                                            kSecAttrAccessibleWhenUnlockedThisDeviceOnly, // Or kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly etc.
-                                           kSecAccessControlPrivateKeyUsage, // | kSecAccessControlBiometryCurrentSet,
+                                           0, // No specific constraints like PrivateKeyUsage or Biometry
                                            error);
 }
 
@@ -232,66 +234,82 @@ int ProvisionIdentityWithCertificate(const char *keyLabel,
     }
 
     // 2. Prepare attributes for adding the certificate to the Keychain
-    // We add the certificate as a separate item, but tag/label it identically
-    // to the private key. The system uses the public key within the certificate
-    // to find the matching private key (including SE keys) to form the SecIdentity.
-    NSDictionary *certAddDict = @{
+    // REMOVED: Explicit public key hash calculation is no longer done here.
+    // The system should link based on the public key within the cert.
+
+
+    NSMutableDictionary *certAddDictMutable = [NSMutableDictionary dictionaryWithDictionary:@{
         (id)kSecClass: (id)kSecClassCertificate,
-        (id)kSecValueRef: (__bridge_transfer id)certificate, // Transfer ownership
-        (id)kSecAttrLabel: nsLabel, // Use the same label as the key
-        (id)kSecAttrApplicationTag: tag, // Optionally use the same tag
-        // Make it persistent (usually desired)
-        (id)kSecAttrIsPermanent: @YES, // Although certs are often added as permanent by default
-    };
+        (id)kSecValueRef: (__bridge id)certificate, // Bridge, transfer ownership later IF SecItemAdd succeeds
+        (id)kSecAttrLabel: nsLabel,
+        //(id)kSecAttrApplicationTag: tag, //  Doesn't seem to work with kSecUseDataProtectionKeychain
+        //(id)kSecAttrIsPermanent: @YES,
+        //(id)kSecAttrAccessible: (id)kSecAttrAccessibleWhenUnlockedThisDeviceOnly, // Match SE key accessibility
+        (id)kSecUseDataProtectionKeychain: @YES // Explicitly use data protection keychain
+    }];
+
+    // REMOVED: No longer adding kSecAttrPublicKeyHash explicitly.
+    // if (publicKeyHashData) {
+    //     [certAddDictMutable setObject:publicKeyHashData forKey:(id)kSecAttrPublicKeyHash];
+    // }
+
+    // Make immutable for SecItemAdd
+    NSDictionary *certAddDict = [NSDictionary dictionaryWithDictionary:certAddDictMutable];
+
 
     // 3. Add the certificate to the Keychain
     OSStatus status = SecItemAdd((__bridge CFDictionaryRef)certAddDict, NULL);
 
+    // If add succeeded, transfer ownership of the certificate ref
+    if (status == errSecSuccess) {
+        CFBridgingRelease(certificate); // Transfer ownership (release the CF object)
+         NSLog(@"[SE Identity] Successfully added certificate and provisioned identity with label: %@", nsLabel);
+    }
     // Handle potential duplicate item error (maybe update instead?)
-    if (status == errSecDuplicateItem) {
+    else if (status == errSecDuplicateItem) {
         NSLog(@"[SE Identity] Certificate with label '%@' already exists. Attempting to update.", nsLabel);
-        // Query for the existing certificate
+        // Query for the existing certificate based on label/tag (or pubkeyhash?)
         NSDictionary *query = @{
             (id)kSecClass: (id)kSecClassCertificate,
             (id)kSecAttrLabel: nsLabel,
             (id)kSecAttrApplicationTag: tag
+            // Consider adding kSecAttrPublicKeyHash to query if available? // REMOVED: No longer adding hash.
         };
-        // Attributes to update (replace the certificate data)
-        NSDictionary *update = @{
-            (id)kSecValueRef: (__bridge id)certificate // Don't transfer ownership here, SecItemUpdate uses it
-        };
+        // Attributes to update: replace certificate data and ensure accessibility matches.
+        NSMutableDictionary *updateMutable = [NSMutableDictionary dictionaryWithDictionary:@{
+             (id)kSecValueRef: (__bridge id)certificate // Don't transfer ownership here
+        }];
+        // REMOVED: No longer updating kSecAttrPublicKeyHash explicitly.
+        // if (publicKeyHashData) {
+        //      // Might as well update the hash too, though it should match
+        //     [updateMutable setObject:publicKeyHashData forKey:(id)kSecAttrPublicKeyHash];
+        // }
+        // Also ensure accessibility is set on update
+        [updateMutable setObject:(id)kSecAttrAccessibleWhenUnlockedThisDeviceOnly forKey:(id)kSecAttrAccessible];
+        // Explicitly use data protection keychain on update too
+        [updateMutable setObject:@YES forKey:(id)kSecUseDataProtectionKeychain];
+        NSDictionary *update = [NSDictionary dictionaryWithDictionary:updateMutable];
+
         status = SecItemUpdate((__bridge CFDictionaryRef)query, (__bridge CFDictionaryRef)update);
-         // Release the certificate ref now if we didn't transfer it earlier
-        // CFRelease(certificate); // Release if update was attempted or add failed other than duplicate
+        CFRelease(certificate); // Release the cert ref since it wasn't transferred by SecItemAdd
 
         if (status != errSecSuccess) {
              NSLog(@"[SE Identity] Error updating existing certificate. Status: %d", (int)status);
-             // Make sure to release the cert ref created earlier if not transferred
-             // CFRelease(certificate); // This was transferred in the SecItemAdd path, careful here.
-             // If add failed with duplicate and update failed, the original cert ref needs release.
-             // Let's simplify: just log the duplicate and return an error for now.
-             NSLog(@"[SE Identity] Error: Certificate with label '%@' already exists and update failed (or wasn't implemented fully). Status: %d", nsLabel, (int)status);
-             // CFRelease(certificate); // Release the ref created at the start
-             return SE_ERR_CERT_ADD_FAILED; // Treat duplicate without update as failure for simplicity
+             return SE_ERR_CERT_ADD_FAILED;
         }
          NSLog(@"[SE Identity] Successfully updated existing certificate with label: %@", nsLabel);
 
-    } else if (status != errSecSuccess) {
+    } else { // Add failed for reasons other than duplicate
         NSLog(@"[SE Identity] Error adding certificate to Keychain. Status: %d", (int)status);
-        // CFRelease(certificate); // Release if add failed (and wasn't transferred)
+        CFRelease(certificate); // Release the cert ref since it wasn't transferred
         return SE_ERR_CERT_ADD_FAILED;
-    } else {
-         NSLog(@"[SE Identity] Successfully added certificate and provisioned identity with label: %@", nsLabel);
     }
 
-    // If SecItemAdd succeeded, the certificate ref was transferred (__bridge_transfer).
-    // If it failed with duplicate and update succeeded, it was bridged (__bridge).
-    // If add failed otherwise, it needs release. Careful management is needed.
-    // The code above assumes success or handles duplicate+update failure.
+    // Certificate ref ownership is managed above (released or transferred).
 
     // At this point, macOS should implicitly link the certificate and the
     // Secure Enclave private key (found via matching public keys) into a SecIdentityRef
-    // usable by applications like Chrome for mTLS.
+    // usable by applications like Chrome for mTLS. The explicit kSecAttrPublicKeyHash should help.
 
     return SE_SUCCESS;
 }
@@ -537,4 +555,133 @@ int SignDigestWithSEKey(const char *keyLabel,
 
     NSLog(@"[SE Identity] Successfully signed digest using SE key with label: %@", nsLabel);
     return SE_SUCCESS;
+}
+
+// Lists information about available Keychain identities.
+int ListKeychainIdentities(KeychainIdentityInfo** outIdentityInfos, int* outCount) {
+    if (!outIdentityInfos || !outCount) {
+        NSLog(@"[SE Identity] Error: Invalid output parameters for listing identities.");
+        return SE_ERR_INVALID_INPUT;
+    }
+    *outIdentityInfos = NULL;
+    *outCount = 0;
+
+    // Query for Identity items
+    NSDictionary *query = @{
+        (id)kSecClass: (id)kSecClassIdentity,
+        (id)kSecReturnRef: @YES,          // Return SecIdentityRef objects
+        (id)kSecMatchLimit: (id)kSecMatchLimitAll, // Get all matching items
+        (id)kSecUseDataProtectionKeychain: @YES // Query within the data protection keychain
+    };
+
+    CFArrayRef results = NULL;
+    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, (CFTypeRef *)&results);
+
+    if (status == errSecItemNotFound) {
+        NSLog(@"[SE Identity] No keychain identities found.");
+        return SE_SUCCESS; // Not an error, just no identities found
+    } else if (status != errSecSuccess) {
+        NSLog(@"[SE Identity] Error querying keychain identities. Status: %d", (int)status);
+        if (results) CFRelease(results);
+        // Consider a more specific error code if needed
+        return SE_ERR_KEY_QUERY_FAILED;
+    }
+
+    CFIndex count = CFArrayGetCount(results);
+    if (count == 0) {
+        NSLog(@"[SE Identity] Keychain identity query succeeded but found 0 identities.");
+        CFRelease(results);
+        return SE_SUCCESS; // No identities found
+    }
+
+    // Allocate the array of KeychainIdentityInfo structs
+    KeychainIdentityInfo *identityInfos = (KeychainIdentityInfo *)malloc(count * sizeof(KeychainIdentityInfo));
+    if (!identityInfos) {
+        NSLog(@"[SE Identity] Error: Failed to allocate memory for identity info array.");
+        CFRelease(results);
+        return SE_ERR_UNKNOWN;
+    }
+    // Initialize to zero/NULL
+    memset(identityInfos, 0, count * sizeof(KeychainIdentityInfo));
+
+    int actualCount = 0;
+    for (CFIndex i = 0; i < count; ++i) {
+        SecIdentityRef identityRef = (SecIdentityRef)CFArrayGetValueAtIndex(results, i);
+        if (!identityRef || CFGetTypeID(identityRef) != SecIdentityGetTypeID()) {
+             NSLog(@"[SE Identity] Warning: Skipping invalid item in keychain results (index %ld).", i);
+            continue; // Skip non-identity items
+        }
+
+        // Get the certificate associated with the identity
+        SecCertificateRef certificateRef = NULL;
+        status = SecIdentityCopyCertificate(identityRef, &certificateRef);
+        if (status != errSecSuccess || !certificateRef) {
+            NSLog(@"[SE Identity] Warning: Could not get certificate for identity at index %ld. Status: %d. Skipping.", i, (int)status);
+            if (certificateRef) CFRelease(certificateRef);
+            continue;
+        }
+
+        // Get a displayable name/label (Common Name or Subject Summary)
+        CFStringRef summaryRef = SecCertificateCopySubjectSummary(certificateRef);
+        CFRelease(certificateRef); // Release cert ref obtained from SecIdentityCopyCertificate
+
+        char *labelCopy = NULL;
+        if (summaryRef) {
+            const char *labelCStr = CFStringGetCStringPtr(summaryRef, kCFStringEncodingUTF8);
+            if (labelCStr) {
+                size_t len = strlen(labelCStr) + 1;
+                labelCopy = (char *)malloc(len);
+                if (labelCopy) memcpy(labelCopy, labelCStr, len);
+            } else {
+                CFIndex bufferSize = CFStringGetMaximumSizeForEncoding(CFStringGetLength(summaryRef), kCFStringEncodingUTF8) + 1;
+                labelCopy = (char *)malloc(bufferSize);
+                if (!(labelCopy && CFStringGetCString(summaryRef, labelCopy, bufferSize, kCFStringEncodingUTF8))) {
+                    if (labelCopy) free(labelCopy); labelCopy = NULL;
+                }
+            }
+            CFRelease(summaryRef);
+        }
+
+        if (!labelCopy) {
+             NSLog(@"[SE Identity] Warning: Found identity (index %ld) without a valid label/summary or failed allocation/conversion, skipping.", i);
+             continue; // Skip if we couldn't get a usable label
+        }
+
+        // Store the copied label
+        identityInfos[actualCount].label = labelCopy; // Ownership transferred
+        actualCount++;
+    }
+
+    CFRelease(results); // Release the array of SecIdentityRef
+
+    if (actualCount == 0 && count > 0) {
+         NSLog(@"[SE Identity] Warning: Queried %ld identities, but none had valid labels suitable for return.", count);
+         free(identityInfos); // Free the array itself
+         *outIdentityInfos = NULL; // Ensure output is NULL
+         *outCount = 0;
+         return SE_SUCCESS; // Still success, just no usable identities found
+    } else if (actualCount < count) {
+         NSLog(@"[SE Identity] Warning: Skipped %ld identities due to missing/invalid labels or certs.", count - actualCount);
+         // Optionally realloc identityInfos array to actualCount size, but not critical
+    }
+
+    *outIdentityInfos = identityInfos;
+    *outCount = actualCount;
+
+    NSLog(@"[SE Identity] Successfully listed %d keychain identity infos.", actualCount);
+    return SE_SUCCESS;
+}
+
+// Helper function to free the memory allocated by ListKeychainIdentities
+void FreeKeychainIdentityInfoList(KeychainIdentityInfo *identityInfos, int count) {
+    if (!identityInfos) {
+        return;
+    }
+    for (int i = 0; i < count; ++i) {
+        if (identityInfos[i].label) {
+            free(identityInfos[i].label); // Free the C string label
+        }
+        // Free other fields if added to the struct
+    }
+    free(identityInfos); // Free the array itself
 }

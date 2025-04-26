@@ -59,10 +59,10 @@ var cErrorMap = map[C.int]error{
 	C.SE_SUCCESS:                nil,
 	C.SE_ERR_ACCESS_CONTROL:     errors.New("failed to create SecAccessControl"),
 	C.SE_ERR_KEY_GENERATION:     errors.New("failed to generate SE key pair"),
-	C.SE_ERR_KEY_QUERY_FAILED:   errors.New("failed to query SE private key"),
+	C.SE_ERR_KEY_QUERY_FAILED:   errors.New("failed to query keychain item (key, cert, or identity)"),
 	C.SE_ERR_KEY_NOT_FOUND:      errors.New("SE private key not found"),
 	C.SE_ERR_PUBKEY_EXPORT:      errors.New("failed to export SE public key"),
-	C.SE_ERR_SIGNATURE_FAILED:   errors.New("failed to sign data with SE key"), // Note: Also used by SignDigest error path
+	C.SE_ERR_SIGNATURE_FAILED:   errors.New("failed to sign data/digest with SE key"),
 	C.SE_ERR_CERT_CREATE_FAILED: errors.New("failed to create SecCertificateRef from DER"),
 	C.SE_ERR_CERT_ADD_FAILED:    errors.New("failed to add/update certificate in Keychain"),
 	C.SE_ERR_INVALID_INPUT:      errors.New("invalid input provided to C function"),
@@ -287,6 +287,9 @@ func ProvisionKeychainIdentity(keyLabel string, signedCertDER []byte) error {
 	// --- Step 7: Provision Keychain Identity via Cgo ---
 	log.Println("Step 7: Provisioning Keychain identity with the certificate...")
 
+	if len(signedCertDER) == 0 {
+		return errors.New("seidentity: signed certificate DER cannot be empty")
+	}
 	cCertDER := (*C.uchar)(unsafe.Pointer(&signedCertDER[0]))
 	cCertLen := C.size_t(len(signedCertDER))
 
@@ -300,34 +303,17 @@ func ProvisionKeychainIdentity(keyLabel string, signedCertDER []byte) error {
 
 // Convert C error code to Go error
 func cErrorToGoError(status C.int) error {
-	switch status {
-	case C.SE_SUCCESS:
-		return nil
-	case C.SE_ERR_INVALID_INPUT:
-		return errors.New("seidentity: invalid input parameters")
-	case C.SE_ERR_ACCESS_CONTROL:
-		return errors.New("seidentity: failed to create access control")
-	case C.SE_ERR_KEY_GENERATION:
-		return errors.New("seidentity: key pair generation failed")
-	case C.SE_ERR_PUBKEY_EXPORT:
-		return errors.New("seidentity: public key export failed")
-	case C.SE_ERR_KEY_NOT_FOUND:
-		return errors.New("seidentity: key not found")
-	case C.SE_ERR_AUTH_FAILED:
-		return errors.New("seidentity: user authentication failed or cancelled")
-	case C.SE_ERR_KEY_QUERY_FAILED:
-		return errors.New("seidentity: querying keychain failed")
-	case C.SE_ERR_SIGNATURE_FAILED:
-		return errors.New("seidentity: signing operation failed")
-	case C.SE_ERR_CERT_CREATE_FAILED:
-		return errors.New("seidentity: failed to create certificate object")
-	case C.SE_ERR_CERT_ADD_FAILED:
-		return errors.New("seidentity: failed to add certificate to keychain")
-	case C.SE_ERR_UNKNOWN:
-		return errors.New("seidentity: unknown error (check logs)")
-	default:
-		return fmt.Errorf("seidentity: unexpected status code: %d", status)
+	// Use the map first for cleaner mapping
+	if err, ok := cErrorMap[status]; ok {
+		// If err is nil (for SE_SUCCESS), return nil directly
+		if err == nil {
+			return nil
+		}
+		// Otherwise, return the mapped error
+		return err
 	}
+	// Fallback for unexpected codes
+	return fmt.Errorf("seidentity: unexpected status code: %d", status)
 }
 
 // KeyInfo holds the label and tag for a Secure Enclave key.
@@ -385,4 +371,54 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// KeychainIdentityInfo holds information about a keychain identity.
+type KeychainIdentityInfo struct {
+	Label string // Usually the Common Name or Subject Summary from the certificate
+}
+
+// ListKeychainIdentities retrieves information about all identities (certificate + private key)
+// available to the application in the macOS Keychain.
+func ListKeychainIdentities() ([]KeychainIdentityInfo, error) {
+	var cIdentityInfos *C.KeychainIdentityInfo
+	var cCount C.int
+
+	status := C.ListKeychainIdentities(&cIdentityInfos, &cCount)
+	err := cErrorToGoError(status)
+	if err != nil {
+		// C function expected to handle cleanup on error return
+		return nil, fmt.Errorf("failed to list keychain identities: %w", err)
+	}
+
+	// Ensure the C memory allocated by ListKeychainIdentities is freed
+	if cIdentityInfos != nil {
+		defer C.FreeKeychainIdentityInfoList(cIdentityInfos, cCount)
+	}
+
+	if cCount == 0 {
+		return []KeychainIdentityInfo{}, nil // Return empty slice, not nil
+	}
+
+	// Convert C array of structs to Go slice
+	goIdentityInfos := make([]KeychainIdentityInfo, 0, int(cCount))
+
+	// Create a Go slice header backed by the C array data
+	// #nosec G103 -- unsafe pointer is necessary for CGo interaction here. Lifespan is controlled.
+	cIdentityInfoSlice := (*[1 << 30]C.KeychainIdentityInfo)(unsafe.Pointer(cIdentityInfos))[:cCount:cCount]
+
+	for i := 0; i < int(cCount); i++ {
+		info := KeychainIdentityInfo{}
+		if cIdentityInfoSlice[i].label != nil {
+			// Copy the C string to a Go string
+			info.Label = C.GoString(cIdentityInfoSlice[i].label)
+		} else {
+			// Handle case where label might be unexpectedly nil from C side
+			info.Label = "<Unknown Label>"
+			log.Printf("Warning: Keychain identity at index %d has nil label from C", i)
+		}
+		goIdentityInfos = append(goIdentityInfos, info)
+	}
+
+	return goIdentityInfos, nil
 }

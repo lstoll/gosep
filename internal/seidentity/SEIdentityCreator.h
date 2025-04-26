@@ -78,6 +78,12 @@ typedef struct {
     size_t tagLength; // Length of the tag data.
 } SEKeyInfo;
 
+// Struct to hold information about a Keychain Identity
+typedef struct {
+    char* label; // Typically the Common Name from the certificate (caller must free)
+    // Add other fields if needed, e.g., persistent ref, issuer, etc.
+} KeychainIdentityInfo;
+
 /**
  * Lists the labels and tags of all EC P-256 keys stored in the Secure Enclave
  * matching the query criteria.
@@ -108,6 +114,17 @@ int SignDigestWithSEKey(const char *keyLabel,
                         size_t digestLength,
                         unsigned char **outSignature,
                         size_t *outSignatureLength);
+
+// Lists information (currently just the label/CN) about Keychain identities available to the app.
+// `outIdentityInfos`: Pointer to receive an allocated array of KeychainIdentityInfo structs. Caller must free this array and its contents using FreeKeychainIdentityInfoList.
+// `outCount`: Pointer to receive the number of identities found.
+// Returns SE_SUCCESS on success, or an error code otherwise.
+int ListKeychainIdentities(KeychainIdentityInfo** outIdentityInfos, int* outCount);
+
+// Frees the memory allocated by ListKeychainIdentities.
+// `identityInfos`: The array allocated by ListKeychainIdentities.
+// `count`: The number of elements in the array.
+void FreeKeychainIdentityInfoList(KeychainIdentityInfo *identityInfos, int count);
 
 #ifdef __cplusplus
 } // extern "C"

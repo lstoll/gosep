@@ -7,9 +7,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -18,26 +15,9 @@ const (
 	serverCertFile = "localhost+2.pem"
 	serverKeyFile  = "localhost+2-key.pem"
 	listenAddr     = ":8443" // Port to listen on (requires no special privileges)
-)
 
-// findMkcertCARoot uses the `mkcert -CAROOT` command to find the CA path.
-func findMkcertCARoot() (string, error) {
-	cmd := exec.Command("mkcert", "-CAROOT")
-	output, err := cmd.Output()
-	if err != nil {
-		// Provide more context if mkcert isn't found
-		if ee, ok := err.(*exec.Error); ok && ee.Err == exec.ErrNotFound {
-			return "", fmt.Errorf("'mkcert' command not found in PATH. Please ensure mkcert is installed and accessible: %w", err)
-		}
-		return "", fmt.Errorf("failed to run 'mkcert -CAROOT': %w", err)
-	}
-	// Trim whitespace, as the command might add a newline
-	caPath := strings.TrimSpace(string(output))
-	if caPath == "" {
-		return "", fmt.Errorf("'mkcert -CAROOT' returned an empty path")
-	}
-	return caPath, nil
-}
+	caCertPath = "ca-cert.pem"
+)
 
 // simple mTLS authenticated handler
 func helloHandler(w http.ResponseWriter, r *http.Request) {
@@ -74,13 +54,13 @@ func main() {
 	fmt.Println("✅ Server certificate and key found.")
 
 	// --- 2. Find mkcert CA Root ---
-	fmt.Println("Finding mkcert CA root directory...")
-	caRootDir, err := findMkcertCARoot()
-	if err != nil {
-		log.Fatalf("❌ Error finding mkcert CA root: %v", err)
-	}
-	caCertPath := filepath.Join(caRootDir, "rootCA.pem")
-	fmt.Printf("✅ Found mkcert CA certificate path: %s\n", caCertPath)
+	// fmt.Println("Finding mkcert CA root directory...")
+	// caRootDir, err := findMkcertCARoot()
+	// if err != nil {
+	// 	log.Fatalf("❌ Error finding mkcert CA root: %v", err)
+	// }
+	// caCertPath := filepath.Join(caRootDir, "rootCA.pem")
+	// fmt.Printf("✅ Found mkcert CA certificate path: %s\n", caCertPath)
 
 	// --- 3. Load mkcert CA Certificate ---
 	fmt.Println("Loading mkcert CA certificate...")
