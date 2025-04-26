@@ -1,6 +1,8 @@
 #ifndef SEIdentityCreator_h
 #define SEIdentityCreator_h
 
+#include <stddef.h> // Include for size_t definition
+
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
 #import <LocalAuthentication/LocalAuthentication.h> // For LAContext
@@ -69,6 +71,43 @@ int ProvisionIdentityWithCertificate(const char *keyLabel,
                                      const unsigned char *certificateDER,
                                      size_t certificateDERLength);
 
+// Struct to hold information about a listed key
+typedef struct {
+    char* label;    // The key's label (kSecAttrLabel). Caller must free this.
+    void* tagData;  // Pointer to the key's tag data (kSecAttrApplicationTag). Caller must free this.
+    size_t tagLength; // Length of the tag data.
+} SEKeyInfo;
+
+/**
+ * Lists the labels and tags of all EC P-256 keys stored in the Secure Enclave
+ * matching the query criteria.
+ *
+ * @param outKeyInfos A pointer to receive a dynamically allocated array of SEKeyInfo structs.
+ * Both the array itself and the 'label' and 'tagData' fields within each struct
+ * are dynamically allocated.
+ * The caller is responsible for freeing this memory using FreeSEKeyInfoList().
+ * On failure or if no keys are found, *outKeyInfos will be set to NULL.
+ * @param outCount A pointer to store the number of key infos returned in outKeyInfos.
+ * @return SE_SUCCESS on success (even if no keys are found), or a negative SE_ERR_* code on failure.
+ */
+int ListSEKeyInfos(SEKeyInfo** outKeyInfos, int* outCount);
+
+/**
+ * Frees the memory allocated by ListSEKeyInfos.
+ *
+ * @param keyInfos The array of SEKeyInfo structs returned by ListSEKeyInfos.
+ * @param count The number of structs in the array, as returned by ListSEKeyInfos.
+ */
+void FreeSEKeyInfoList(SEKeyInfo *keyInfos, int count);
+
+// Sign a pre-computed digest using the SE key associated with the label.
+// The digest is expected to be SHA-256 for use with P-256 keys here.
+// Caller MUST free the returned outSignature buffer using free().
+int SignDigestWithSEKey(const char *keyLabel,
+                        const unsigned char *digest,
+                        size_t digestLength,
+                        unsigned char **outSignature,
+                        size_t *outSignatureLength);
 
 #ifdef __cplusplus
 } // extern "C"

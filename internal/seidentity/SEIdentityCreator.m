@@ -15,7 +15,7 @@ static SecAccessControlRef CreateBiometricAccessControl(CFErrorRef *error) {
     // Other options include kSecAccessControlUserPresence, kSecAccessControlBiometryAny, kSecAccessControlDevicePasscode
     return SecAccessControlCreateWithFlags(kCFAllocatorDefault,
                                            kSecAttrAccessibleWhenUnlockedThisDeviceOnly, // Or kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly etc.
-                                           kSecAccessControlPrivateKeyUsage | kSecAccessControlBiometryCurrentSet,
+                                           kSecAccessControlPrivateKeyUsage, // | kSecAccessControlBiometryCurrentSet,
                                            error);
 }
 
@@ -293,5 +293,248 @@ int ProvisionIdentityWithCertificate(const char *keyLabel,
     // Secure Enclave private key (found via matching public keys) into a SecIdentityRef
     // usable by applications like Chrome for mTLS.
 
+    return SE_SUCCESS;
+}
+
+// Function to list labels and tags of keys stored in the Secure Enclave
+int ListSEKeyInfos(SEKeyInfo** outKeyInfos, int* outCount) {
+    if (!outKeyInfos || !outCount) {
+        NSLog(@"[SE Identity] Error: Invalid output parameters for listing key infos.");
+        return SE_ERR_INVALID_INPUT;
+    }
+    *outKeyInfos = NULL;
+    *outCount = 0;
+
+    // Query for EC keys stored in the Secure Enclave
+    NSDictionary *query = @{
+        (id)kSecClass: (id)kSecClassKey,
+        (id)kSecAttrKeyType: (id)kSecAttrKeyTypeECSECPrimeRandom,
+        (id)kSecAttrTokenID: (id)kSecAttrTokenIDSecureEnclave,
+        (id)kSecReturnAttributes: @YES, // We want the attributes dictionary
+        (id)kSecMatchLimit: (id)kSecMatchLimitAll // Get all matching items
+    };
+
+    CFArrayRef results = NULL;
+    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, (CFTypeRef *)&results);
+
+    if (status == errSecItemNotFound) {
+        NSLog(@"[SE Identity] No Secure Enclave keys found matching the criteria.");
+        return SE_SUCCESS; // Not an error, just no keys found
+    } else if (status != errSecSuccess) {
+        NSLog(@"[SE Identity] Error querying Secure Enclave keys. Status: %d", (int)status);
+        if (results) CFRelease(results);
+        return SE_ERR_KEY_QUERY_FAILED;
+    }
+
+    CFIndex count = CFArrayGetCount(results);
+    if (count == 0) {
+        NSLog(@"[SE Identity] Query succeeded but found 0 keys.");
+        CFRelease(results);
+        return SE_SUCCESS; // No keys found
+    }
+
+    // Allocate the array of SEKeyInfo structs
+    SEKeyInfo *keyInfos = (SEKeyInfo *)malloc(count * sizeof(SEKeyInfo));
+    if (!keyInfos) {
+        NSLog(@"[SE Identity] Error: Failed to allocate memory for key info array.");
+        CFRelease(results);
+        return SE_ERR_UNKNOWN;
+    }
+    // Initialize to zero/NULL
+    memset(keyInfos, 0, count * sizeof(SEKeyInfo));
+
+    int actualCount = 0;
+    for (CFIndex i = 0; i < count; ++i) {
+        CFDictionaryRef item = (CFDictionaryRef)CFArrayGetValueAtIndex(results, i);
+        if (!item || CFGetTypeID(item) != CFDictionaryGetTypeID()) {
+            continue; // Skip non-dictionary items
+        }
+
+        // Get Label
+        CFStringRef labelRef = (CFStringRef)CFDictionaryGetValue(item, kSecAttrLabel);
+        char *labelCopy = NULL;
+        if (labelRef && CFGetTypeID(labelRef) == CFStringGetTypeID()) {
+            const char *labelCStr = CFStringGetCStringPtr(labelRef, kCFStringEncodingUTF8);
+            if (labelCStr) {
+                size_t len = strlen(labelCStr) + 1;
+                labelCopy = (char *)malloc(len);
+                if (labelCopy) memcpy(labelCopy, labelCStr, len);
+            } else {
+                CFIndex bufferSize = CFStringGetMaximumSizeForEncoding(CFStringGetLength(labelRef), kCFStringEncodingUTF8) + 1;
+                labelCopy = (char *)malloc(bufferSize);
+                if (!(labelCopy && CFStringGetCString(labelRef, labelCopy, bufferSize, kCFStringEncodingUTF8))) {
+                    if (labelCopy) free(labelCopy); labelCopy = NULL;
+                }
+            }
+        }
+        if (!labelCopy) {
+             NSLog(@"[SE Identity] Warning: Found key without a valid label or failed allocation/conversion, skipping.");
+             // Continue to next item, but don't increment actualCount yet.
+             // Or should we add it with NULL label? Let's skip for now.
+             continue;
+        }
+
+        // Get Tag
+        CFDataRef tagRef = (CFDataRef)CFDictionaryGetValue(item, kSecAttrApplicationTag);
+        void *tagDataCopy = NULL;
+        size_t tagLength = 0;
+        if (tagRef && CFGetTypeID(tagRef) == CFDataGetTypeID()) {
+            tagLength = CFDataGetLength(tagRef);
+            if (tagLength > 0) {
+                tagDataCopy = malloc(tagLength);
+                if (tagDataCopy) {
+                    memcpy(tagDataCopy, CFDataGetBytePtr(tagRef), tagLength);
+                } else {
+                     NSLog(@"[SE Identity] Warning: Failed to allocate memory for tag data, skipping tag.");
+                    tagLength = 0; // Reset length if allocation failed
+                }
+            }
+        } else {
+             NSLog(@"[SE Identity] Warning: Found key without a valid tag (kSecAttrApplicationTag), skipping tag.");
+        }
+
+        // If tag allocation failed, tagDataCopy is NULL and tagLength is 0.
+        // If tag was missing/invalid, tagDataCopy is NULL and tagLength is 0.
+
+        // Store the copied data in the struct
+        keyInfos[actualCount].label = labelCopy; // Ownership transferred
+        keyInfos[actualCount].tagData = tagDataCopy; // Ownership transferred (or NULL)
+        keyInfos[actualCount].tagLength = tagLength;
+        actualCount++;
+    }
+
+    CFRelease(results);
+
+    if (actualCount == 0 && count > 0) {
+         NSLog(@"[SE Identity] Warning: Queried %ld keys, but none had valid labels suitable for return.", count);
+         free(keyInfos); // Free the array itself
+         return SE_SUCCESS; // Still success, just no usable keys found
+    } else if (actualCount < count) {
+         NSLog(@"[SE Identity] Warning: Skipped %ld keys due to missing/invalid labels.", count - actualCount);
+         // Optionally realloc keyInfos array to actualCount size, but not critical
+    }
+
+    *outKeyInfos = keyInfos;
+    *outCount = actualCount;
+
+    NSLog(@"[SE Identity] Successfully listed %d Secure Enclave key infos.", actualCount);
+    return SE_SUCCESS;
+}
+
+// Helper function to free the memory allocated by ListSEKeyInfos
+void FreeSEKeyInfoList(SEKeyInfo *keyInfos, int count) {
+    if (!keyInfos) {
+        return;
+    }
+    for (int i = 0; i < count; ++i) {
+        if (keyInfos[i].label) {
+            free(keyInfos[i].label);
+        }
+        if (keyInfos[i].tagData) {
+            free(keyInfos[i].tagData);
+        }
+    }
+    free(keyInfos);
+}
+
+// Implementation for signing a pre-computed digest
+int SignDigestWithSEKey(const char *keyLabel,
+                        const unsigned char *digest,
+                        size_t digestLength,
+                        unsigned char **outSignature,
+                        size_t *outSignatureLength) {
+
+    if (!keyLabel || !digest || digestLength == 0 || !outSignature || !outSignatureLength) {
+         NSLog(@"[SE Identity] Error: Invalid input parameters for digest signing.");
+        return SE_ERR_INVALID_INPUT;
+    }
+    *outSignature = NULL;
+    *outSignatureLength = 0;
+
+    // Basic check for expected digest length (SHA-256 = 32 bytes)
+    // This could be made more flexible if needed.
+    if (digestLength != 32) {
+         NSLog(@"[SE Identity] Warning: Digest length (%zu) is not 32 bytes (expected SHA-256).", digestLength);
+        // Proceed anyway, but log warning.
+    }
+
+    NSString *nsLabel = [NSString stringWithUTF8String:keyLabel];
+    NSData *tag = [nsLabel dataUsingEncoding:NSUTF8StringEncoding];
+
+    // Query to find the private key
+    NSDictionary *query = @{
+        (id)kSecClass: (id)kSecClassKey,
+        (id)kSecAttrKeyType: (id)kSecAttrKeyTypeECSECPrimeRandom,
+        (id)kSecAttrApplicationTag: tag,
+        (id)kSecAttrLabel: nsLabel,
+        (id)kSecReturnRef: @YES,
+        (id)kSecUseAuthenticationContext: GetLAContext() // Provide context for potential UI prompt
+    };
+
+    SecKeyRef privateKey = NULL;
+    OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, (CFTypeRef *)&privateKey);
+
+    if (status == errSecItemNotFound) {
+        NSLog(@"[SE Identity] Error: Private key with label '%@' not found for digest signing.", nsLabel);
+        return SE_ERR_KEY_NOT_FOUND;
+    } else if (status == errSecUserCanceled || status == errSecAuthFailed) {
+         NSLog(@"[SE Identity] Error: User cancelled or failed biometric authentication during digest signing. Status: %d", (int)status);
+         if (privateKey) CFRelease(privateKey);
+         return SE_ERR_AUTH_FAILED;
+    } else if (status != errSecSuccess) {
+        NSLog(@"[SE Identity] Error querying private key for digest signing. Status: %d", (int)status);
+        if (privateKey) CFRelease(privateKey);
+        return SE_ERR_KEY_QUERY_FAILED;
+    }
+
+    if (!privateKey) {
+         NSLog(@"[SE Identity] Error: SecItemCopyMatching succeeded but returned NULL key ref for digest signing.");
+         return SE_ERR_KEY_QUERY_FAILED;
+    }
+
+    // Determine the signing algorithm (ECDSA with SHA-256 *Digest*)
+    SecKeyAlgorithm algorithm = kSecKeyAlgorithmECDSASignatureDigestX962SHA256;
+    if (!SecKeyIsAlgorithmSupported(privateKey, kSecKeyOperationTypeSign, algorithm)) {
+        NSLog(@"[SE Identity] Error: Key does not support digest signing algorithm %@", algorithm);
+        CFRelease(privateKey);
+        return SE_ERR_SIGNATURE_FAILED;
+    }
+
+    NSData *digestNS = [NSData dataWithBytes:digest length:digestLength];
+    CFErrorRef signError = NULL;
+
+    // Perform the signing operation using the digest
+    NSData *signatureData = (NSData *)CFBridgingRelease(SecKeyCreateSignature(privateKey,
+                                                                             algorithm,
+                                                                             (__bridge CFDataRef)digestNS, // Pass the digest directly
+                                                                             &signError));
+    CFRelease(privateKey);
+
+    if (!signatureData) {
+        NSError *nsError = CFErrorToNSError(signError);
+        if ([nsError.domain isEqualToString:LAErrorDomain] && (nsError.code == LAErrorUserCancel || nsError.code == LAErrorAuthenticationFailed)) {
+             NSLog(@"[SE Identity] Digest signing failed: User cancelled or failed biometric authentication: %@", nsError);
+             if (signError) CFRelease(signError);
+             return SE_ERR_AUTH_FAILED;
+        } else {
+            NSLog(@"[SE Identity] Error creating signature from digest: %@", nsError);
+            if (signError) CFRelease(signError);
+            return SE_ERR_SIGNATURE_FAILED;
+        }
+    }
+
+    // Allocate memory for the output buffer (caller must free)
+    size_t len = [signatureData length];
+    unsigned char *buffer = (unsigned char *)malloc(len);
+     if (!buffer) {
+         NSLog(@"[SE Identity] Error: Failed to allocate memory for digest signature buffer.");
+         return SE_ERR_UNKNOWN;
+    }
+    memcpy(buffer, [signatureData bytes], len);
+
+    *outSignature = buffer;
+    *outSignatureLength = len;
+
+    NSLog(@"[SE Identity] Successfully signed digest using SE key with label: %@", nsLabel);
     return SE_SUCCESS;
 }

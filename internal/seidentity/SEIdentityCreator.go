@@ -2,7 +2,7 @@ package seidentity
 
 /*
 #cgo CFLAGS: -Wno-unused-command-line-argument -fobjc-arc -x objective-c
-#cgo LDFLAGS: -framework Foundation -framework Security -framework LocalAuthentication -L. -lSEIdentityCreator
+#cgo LDFLAGS: -framework Foundation -framework Security -framework LocalAuthentication
 
 #include <stdlib.h> // For C.free
 #include "SEIdentityCreator.h"
@@ -10,20 +10,49 @@ package seidentity
 import "C" // Import C symbols
 
 import (
+	"crypto"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
 	"errors"
+	"fmt"
+	"io"
 	"log"
-	"math/big"
-	"os"
-	"time"
-	"unsafe" // Required for Cgo pointer handling
+	"math/big" // Needed for parsing signature R, S and low-S check
+	"unsafe"   // Required for Cgo pointer handling
 )
+
+// RFC 2986 CertificationRequestInfo
+type certificationRequestInfo struct {
+	Version       int
+	Subject       asn1.RawValue
+	SubjectPKInfo struct {
+		Algorithm pkix.AlgorithmIdentifier
+		PublicKey asn1.BitString
+	} // implicit sequence
+	Attributes []attributeTypeAndValueSET `asn1:"tag:0"` // Context-specific tag 0 for Attributes
+}
+
+// Define pkix.AttributeTypeAndValueSET if not available or for clarity
+// (based on crypto/x509/pkix types)
+type attributeTypeAndValue struct {
+	Type  asn1.ObjectIdentifier
+	Value asn1.RawValue
+}
+
+type attributeTypeAndValueSET struct {
+	Type  asn1.ObjectIdentifier
+	Value [][]attributeTypeAndValue `asn1:"set"`
+}
+
+// ecdsaSignature is a helper struct for ASN.1 parsing ECDSA signatures
+type ecdsaSignature struct {
+	R, S *big.Int
+}
 
 // Error mapping from C error codes
 var cErrorMap = map[C.int]error{
@@ -33,7 +62,7 @@ var cErrorMap = map[C.int]error{
 	C.SE_ERR_KEY_QUERY_FAILED:   errors.New("failed to query SE private key"),
 	C.SE_ERR_KEY_NOT_FOUND:      errors.New("SE private key not found"),
 	C.SE_ERR_PUBKEY_EXPORT:      errors.New("failed to export SE public key"),
-	C.SE_ERR_SIGNATURE_FAILED:   errors.New("failed to sign data with SE key"),
+	C.SE_ERR_SIGNATURE_FAILED:   errors.New("failed to sign data with SE key"), // Note: Also used by SignDigest error path
 	C.SE_ERR_CERT_CREATE_FAILED: errors.New("failed to create SecCertificateRef from DER"),
 	C.SE_ERR_CERT_ADD_FAILED:    errors.New("failed to add/update certificate in Keychain"),
 	C.SE_ERR_INVALID_INPUT:      errors.New("invalid input provided to C function"),
@@ -41,12 +70,146 @@ var cErrorMap = map[C.int]error{
 	C.SE_ERR_UNKNOWN:            errors.New("unknown C error"),
 }
 
-func main() {
-	keyLabel := "com.example.mysekey.mtls-" + time.Now().Format("20060102150405")
+// SecureEnclaveSigner implements crypto.Signer using a Secure Enclave key.
+// Note: Assumes the key identified by KeyLabel exists and is accessible.
+type SecureEnclaveSigner struct {
+	publicKey crypto.PublicKey
+	keyLabel  string
+}
+
+// NewSecureEnclaveSigner creates a signer instance.
+// It currently requires the public key to be passed in, as fetching it dynamically
+// within the Signer methods isn't implemented yet.
+func NewSecureEnclaveSigner(label string, pub crypto.PublicKey) (*SecureEnclaveSigner, error) {
+	// We could add a check here to ensure the key label exists, but for now,
+	// assume it does and errors will occur during Sign().
+	if pub == nil {
+		return nil, errors.New("public key cannot be nil")
+	}
+	return &SecureEnclaveSigner{
+		publicKey: pub,
+		keyLabel:  label,
+	}, nil
+}
+
+// Public returns the public key corresponding to the opaque private key.
+func (s *SecureEnclaveSigner) Public() crypto.PublicKey {
+	return s.publicKey
+}
+
+// Sign signs the provided digest using the Secure Enclave key.
+// It ignores the rand io.Reader. The opts parameter is used to verify the hash algorithm.
+// It also enforces low-S signature values as required by Go's verifier.
+func (s *SecureEnclaveSigner) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
+	// Verify hash algorithm (we only support SHA256 with the C function)
+	if opts == nil || opts.HashFunc() != crypto.SHA256 {
+		return nil, fmt.Errorf("unsupported hash function: %v, only SHA256 is supported", opts.HashFunc())
+	}
+	if len(digest) != crypto.SHA256.Size() {
+		return nil, fmt.Errorf("invalid digest size: expected %d, got %d", crypto.SHA256.Size(), len(digest))
+	}
+
+	log.Printf("SecureEnclaveSigner: Signing digest for key label '%s'", s.keyLabel)
+
+	cKeyLabel := C.CString(s.keyLabel)
+	defer C.free(unsafe.Pointer(cKeyLabel))
+
+	var cSignature *C.uchar
+	var cSignatureLen C.size_t
+
+	// Ensure digest is not empty before taking address
+	if len(digest) == 0 {
+		return nil, errors.New("digest cannot be empty")
+	}
+	cDigest := (*C.uchar)(unsafe.Pointer(&digest[0]))
+	cDigestLen := C.size_t(len(digest))
+
+	// Call the C function that signs the digest
+	ret := C.SignDigestWithSEKey(cKeyLabel, cDigest, cDigestLen, &cSignature, &cSignatureLen)
+	if ret != C.SE_SUCCESS {
+		err := cErrorToGoError(ret)
+		log.Printf("SecureEnclaveSigner: C.SignDigestWithSEKey failed for label '%s': %v", s.keyLabel, err)
+		return nil, fmt.Errorf("seidentity: C.SignDigestWithSEKey failed: %w", err)
+	}
+	if cSignature == nil || cSignatureLen == 0 {
+		log.Printf("SecureEnclaveSigner: C.SignDigestWithSEKey returned success but signature is nil/empty for label '%s'", s.keyLabel)
+		return nil, errors.New("seidentity: C.SignDigestWithSEKey returned nil signature")
+	}
+	defer C.free(unsafe.Pointer(cSignature))
+
+	signatureBytes := C.GoBytes(unsafe.Pointer(cSignature), C.int(cSignatureLen))
+	log.Printf("SecureEnclaveSigner: Successfully signed digest for key label '%s', signature length: %d", s.keyLabel, len(signatureBytes))
+
+	// --- Parse and enforce low-S signature values ---
+	var parsedSig ecdsaSignature
+	rest, err := asn1.Unmarshal(signatureBytes, &parsedSig)
+	if err != nil {
+		log.Printf("SecureEnclaveSigner: Failed to ASN.1 unmarshal signature from C: %v. Bytes: %x", err, signatureBytes)
+		// Return original bytes if parsing failed, maybe verification will work somehow?
+		return signatureBytes, nil
+	} else if len(rest) > 0 {
+		log.Printf("SecureEnclaveSigner: Trailing data after ASN.1 unmarshalling signature from C (%d bytes): %x", len(rest), rest)
+		// Return original bytes if parsing had leftovers
+		return signatureBytes, nil
+	} else {
+		log.Printf("SecureEnclaveSigner: Successfully ASN.1 unmarshalled signature. R=%s, S=%s", parsedSig.R.Text(16), parsedSig.S.Text(16))
+	}
+
+	// Prepare bytes for verification/return
+	curve := elliptic.P256() // Assuming P256 based on key generation
+	curveN := curve.Params().N
+	halfN := new(big.Int).Div(curveN, big.NewInt(2))
+
+	var finalSignatureBytes []byte
+
+	if parsedSig.S.Cmp(halfN) > 0 {
+		// S is high, replace with N - S
+		log.Printf("SecureEnclaveSigner: Original S value (%s) is high. Normalizing to low-S.", parsedSig.S.Text(16))
+		parsedSig.S.Sub(curveN, parsedSig.S)
+		log.Printf("SecureEnclaveSigner: Normalized S value: %s", parsedSig.S.Text(16))
+
+		// Re-marshal the signature with the low-S value
+		normalizedBytes, errMarshal := asn1.Marshal(parsedSig)
+		if errMarshal != nil {
+			log.Printf("SecureEnclaveSigner: Failed to re-marshal low-S signature: %v", errMarshal)
+			return nil, fmt.Errorf("failed to marshal low-s signature: %w", errMarshal)
+		}
+		finalSignatureBytes = normalizedBytes
+		log.Printf("SecureEnclaveSigner: Using normalized low-S signature for verification/return. Length: %d", len(finalSignatureBytes))
+	} else {
+		// S was already low
+		log.Printf("SecureEnclaveSigner: S value (%s) is already low. Using original signature for verification/return.", parsedSig.S.Text(16))
+		finalSignatureBytes = signatureBytes
+	}
+
+	// --- Optional Debug: Explicit Verification Step ---
+	ecdsaPubKey, ok := s.publicKey.(*ecdsa.PublicKey)
+	if !ok {
+		log.Printf("SecureEnclaveSigner: Public key is not ECDSA (*ecdsa.PublicKey), cannot verify locally.")
+	} else {
+		verified := ecdsa.VerifyASN1(ecdsaPubKey, digest, finalSignatureBytes)
+		if verified {
+			log.Printf("SecureEnclaveSigner: <<< LOCAL VERIFICATION SUCCEEDED >>>")
+		} else {
+			log.Printf("SecureEnclaveSigner: <<< LOCAL VERIFICATION FAILED >>>")
+			// If local verification fails, the signature is fundamentally wrong.
+			return nil, errors.New("seidentity: locally generated signature failed local verification")
+		}
+	}
+	// --- End Debug ---
+
+	// Return the final signature bytes (normalized or original)
+	return finalSignatureBytes, nil
+}
+
+// CreateKeyCSR creates a CSR for the given request, provisioning a new SE key pair.
+// It uses a crypto.Signer wrapping the SE key.
+func CreateKeyCSR(req *x509.CertificateRequest, keyLabel string) ([]byte, error) {
+
 	log.Printf("Using Keychain Label: %s", keyLabel)
 
 	// --- Step 1: Generate SE Key Pair and Get Public Key ---
-	log.Println("Step 1: Generating Secure Enclave key pair...")
+	log.Println("Step 1: Generating Secure Enclave key pair and getting public key...")
 	cKeyLabel := C.CString(keyLabel)
 	defer C.free(unsafe.Pointer(cKeyLabel))
 
@@ -55,177 +218,71 @@ func main() {
 
 	ret := C.GenerateSEKeyPairAndGetPublicKey(cKeyLabel, &cPubKeyDER, &cPubKeyLen)
 	if ret != C.SE_SUCCESS {
-		log.Fatalf("Error generating key pair: %v", cErrorMap[ret])
+		return nil, fmt.Errorf("error generating key pair: %w", cErrorToGoError(ret))
 	}
 	if cPubKeyDER == nil || cPubKeyLen == 0 {
-		log.Fatalf("C function returned success but public key is nil or empty")
+		return nil, errors.New("C function returned success but public key is nil or empty")
 	}
-	defer C.free(unsafe.Pointer(cPubKeyDER)) // Free memory allocated by C
+	defer C.free(unsafe.Pointer(cPubKeyDER))
 
-	// Convert C buffer to Go slice
-	publicKeyDER := C.GoBytes(unsafe.Pointer(cPubKeyDER), C.int(cPubKeyLen))
-	log.Printf("Successfully generated key pair. Public Key DER length: %d", len(publicKeyDER))
+	// Convert C buffer to Go slice (raw key bytes)
+	rawPublicKeyBytes := C.GoBytes(unsafe.Pointer(cPubKeyDER), C.int(cPubKeyLen))
+	log.Printf("Raw Public Key bytes length: %d", len(rawPublicKeyBytes))
 
-	// Parse the public key
-	pubKey, err := x509.ParsePKIXPublicKey(publicKeyDER)
+	// Reconstruct the ECDSA public key from raw bytes
+	curve := elliptic.P256()
+	x, y := elliptic.Unmarshal(curve, rawPublicKeyBytes)
+	if x == nil {
+		return nil, fmt.Errorf("error unmarshalling raw public key bytes from SE for curve P256. Length: %d, Bytes (first 10): %x", len(rawPublicKeyBytes), rawPublicKeyBytes[:min(10, len(rawPublicKeyBytes))])
+	}
+	ecdsaPubKey := &ecdsa.PublicKey{
+		Curve: curve,
+		X:     x,
+		Y:     y,
+	}
+	log.Printf("Reconstructed ECDSA public key. Curve: %s", ecdsaPubKey.Curve.Params().Name)
+
+	// --- Step 2: Create Secure Enclave Signer ---
+	log.Println("Step 2: Creating Secure Enclave signer...")
+	seSigner, err := NewSecureEnclaveSigner(keyLabel, ecdsaPubKey)
 	if err != nil {
-		log.Fatalf("Error parsing public key DER: %v", err)
-	}
-	ecdsaPubKey, ok := pubKey.(*ecdsa.PublicKey)
-	if !ok {
-		log.Fatalf("Public key is not an ECDSA key: %T", pubKey)
-	}
-	log.Printf("Parsed public key type: %T", ecdsaPubKey)
-
-	// --- Step 2: Create CSR Template in Go ---
-	log.Println("Step 2: Creating CSR template...")
-	csrTemplate := x509.CertificateRequest{
-		Subject: pkix.Name{
-			Organization:       []string{"Example Org"},
-			OrganizationalUnit: []string{"Example Unit"},
-			Country:            []string{"DE"}, // Germany
-			Province:           []string{"Berlin"},
-			Locality:           []string{"Berlin"},
-			CommonName:         "My SE Device " + time.Now().Format("150405"),
-		},
-		// DNSNames:    []string{"device.example.com"}, // Optional
-		// EmailAddresses: []string{"device@example.com"}, // Optional
-		SignatureAlgorithm: x509.ECDSAWithSHA256, // Must match key type and signing hash
+		return nil, fmt.Errorf("failed to create Secure Enclave signer: %w", err)
 	}
 
-	// --- Step 3: Get TBS (To-Be-Signed) data for the CSR ---
-	log.Println("Step 3: Generating TBS data for CSR...")
-	// We need to create the TBS structure manually or use CreateCertificateRequest
-	// with a dummy signer just to get the structure, then sign externally.
-	// Let's use CreateCertificateRequest with a dummy signer.
-	dummyPrivKey, _ := ecdsa.GenerateKey(ecdsa.P256(), rand.Reader) // Temporary key
-	csrDER, err := x509.CreateCertificateRequest(rand.Reader, &csrTemplate, dummyPrivKey)
+	// --- Step 3: Prepare CSR Template ---
+	// Note: The PublicKey field in the template is ignored by CreateCertificateRequest
+	// when a Signer is provided; it uses signer.Public().
+	// We *must* specify the SignatureAlgorithm.
+	req.SignatureAlgorithm = x509.ECDSAWithSHA256
+	// Ensure other fields like Subject, SANs etc. are set correctly in the input `req`.
+	log.Printf("Prepared CSR template with Subject: %s, SignatureAlgorithm: %s", req.Subject.String(), req.SignatureAlgorithm)
+
+	// --- Step 4: Create CSR using the Signer ---
+	log.Println("Step 4: Calling x509.CreateCertificateRequest with SE signer...")
+	// This will call seSigner.Sign(), which triggers the C function and potentially biometric auth.
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, req, seSigner)
 	if err != nil {
-		log.Fatalf("Error creating dummy CSR DER: %v", err)
+		// Log the error details, including any underlying C error from the signer
+		log.Printf("Error during x509.CreateCertificateRequest: %v", err)
+		return nil, fmt.Errorf("failed to create CSR using SE signer: %w", err)
 	}
+	log.Println("Successfully created CSR DER using SE signer.")
 
-	// Parse the dummy CSR to extract the TBS part
-	parsedCSR, err := x509.ParseCertificateRequest(csrDER)
-	if err != nil {
-		log.Fatalf("Error parsing dummy CSR DER: %v", err)
-	}
-	if err = parsedCSR.CheckSignature(); err == nil {
-		log.Println("Warning: Dummy CSR signature check passed unexpectedly (should ideally fail or be ignored)")
-	} else {
-		log.Printf("Dummy CSR signature check failed as expected: %v", err)
-	}
+	// --- Step 5: Encode CSR to PEM ---
+	log.Println("Step 5: Encoding CSR to PEM format...")
+	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
+	log.Printf("Successfully encoded CSR to PEM. Length: %d bytes", len(csrPEM))
 
-	// The TBSCertificateRequest structure is embedded within the parsed CSR.
-	// We need the raw bytes of this part.
-	tbsCSRContents := parsedCSR.RawTBSCertificateRequest
-	log.Printf("TBS CSR data length: %d", len(tbsCSRContents))
+	return csrPEM, nil
+}
 
-	// --- Step 4: Sign TBS Data using SE Key via Cgo ---
-	log.Println("Step 4: Signing TBS data with Secure Enclave key (will likely require Touch ID/Face ID)...")
-	var cSignature *C.uchar
-	var cSignatureLen C.size_t
+// ProvisionKeychainIdentity provisions the keychain with the signed certificate.
+// (No changes needed here)
+func ProvisionKeychainIdentity(keyLabel string, signedCertDER []byte) error {
 
-	// Convert Go slice to C buffer (no copy needed for input)
-	cDataToSign := (*C.uchar)(unsafe.Pointer(&tbsCSRContents[0]))
-	cDataLen := C.size_t(len(tbsCSRContents))
-
-	ret = C.SignDataWithSEKey(cKeyLabel, cDataToSign, cDataLen, &cSignature, &cSignatureLen)
-	if ret != C.SE_SUCCESS {
-		log.Fatalf("Error signing data: %v", cErrorMap[ret])
-	}
-	if cSignature == nil || cSignatureLen == 0 {
-		log.Fatalf("C function returned success but signature is nil or empty")
-	}
-	defer C.free(unsafe.Pointer(cSignature))
-
-	signatureBytes := C.GoBytes(unsafe.Pointer(cSignature), C.int(cSignatureLen))
-	log.Printf("Successfully signed data. Signature length: %d", len(signatureBytes))
-
-	// --- Step 5: Assemble Final Signed CSR ---
-	log.Println("Step 5: Assembling final signed CSR...")
-	// The final CSR structure is: CertificateRequest SEQUENCE {
-	//      tbsCertificateRequest TBSCertificateRequest,
-	//      signatureAlgorithm    AlgorithmIdentifier,
-	//      signature             BIT STRING
-	// }
-	// We already have the tbsCertificateRequest bytes (tbsCSRContents)
-	// We need the signatureAlgorithm identifier (use the one from the parsed dummy CSR)
-	// We have the signatureBytes.
-
-	finalCSR := struct {
-		TBSCertificateRequest asn1.RawValue
-		SignatureAlgorithm    pkix.AlgorithmIdentifier
-		SignatureValue        asn1.BitString
-	}{
-		TBSCertificateRequest: asn1.RawValue{FullBytes: tbsCSRContents},
-		SignatureAlgorithm:    parsedCSR.SignatureAlgorithm, // From the dummy parsed CSR
-		SignatureValue:        asn1.BitString{Bytes: signatureBytes, BitLength: len(signatureBytes) * 8},
-	}
-
-	finalCSRDER, err := asn1.Marshal(finalCSR)
-	if err != nil {
-		log.Fatalf("Error marshaling final CSR: %v", err)
-	}
-	log.Println("Successfully assembled final CSR.")
-
-	// Save CSR to file (optional)
-	csrFilename := "se_key_csr.pem"
-	csrFile, err := os.Create(csrFilename)
-	if err != nil {
-		log.Printf("Warning: Could not create CSR file: %v", err)
-	} else {
-		defer csrFile.Close()
-		pem.Encode(csrFile, &pem.Block{Type: "CERTIFICATE REQUEST", Bytes: finalCSRDER})
-		log.Printf("Saved CSR to %s", csrFilename)
-	}
-
-	// --- Step 6: (SIMULATED) Get CSR Signed by CA ---
-	log.Println("Step 6: SIMULATING CA Signing...")
-	// In a real scenario, you would send `finalCSRDER` to your CA
-	// and receive back a signed certificate in DER format.
-	// For this example, we will self-sign using a temporary Go key.
-	// DO NOT use this self-signed cert for real mTLS unless the server trusts the dummy CA.
-	caPrivKey, _ := ecdsa.GenerateKey(ecdsa.P256(), rand.Reader)
-	caTemplate := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "Dummy CA"},
-		NotBefore:    time.Now().Add(-1 * time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
-		IsCA:         true,
-		KeyUsage:     x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-	}
-	// Create a certificate template based on the CSR
-	certTemplate := &x509.Certificate{
-		Version:            parsedCSR.Version, // Use version from CSR
-		SerialNumber:       big.NewInt(2),     // Unique serial
-		Subject:            parsedCSR.Subject, // Use subject from CSR
-		PublicKeyAlgorithm: parsedCSR.PublicKeyAlgorithm,
-		PublicKey:          ecdsaPubKey,          // The actual SE public key
-		SignatureAlgorithm: x509.ECDSAWithSHA256, // CA signing algorithm
-		NotBefore:          time.Now().Add(-10 * time.Minute),
-		NotAfter:           time.Now().Add(24 * time.Hour * 90), // 90 days validity
-		KeyUsage:           x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:        []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, // For mTLS
-		// DNSNames:        parsedCSR.DNSNames, // Copy relevant fields
-		// EmailAddresses: parsedCSR.EmailAddresses,
-	}
-
-	signedCertDER, err := x509.CreateCertificate(rand.Reader, certTemplate, caTemplate, ecdsaPubKey, caPrivKey)
-	if err != nil {
-		log.Fatalf("Error creating self-signed certificate: %v", err)
-	}
-	log.Printf("Successfully created (self-signed) certificate. DER length: %d", len(signedCertDER))
-
-	// Save certificate (optional)
-	certFilename := "se_key_cert.pem"
-	certFile, err := os.Create(certFilename)
-	if err != nil {
-		log.Printf("Warning: Could not create certificate file: %v", err)
-	} else {
-		defer certFile.Close()
-		pem.Encode(certFile, &pem.Block{Type: "CERTIFICATE", Bytes: signedCertDER})
-		log.Printf("Saved certificate to %s", certFilename)
-	}
+	// Convert keyLabel to C string
+	cKeyLabel := C.CString(keyLabel)
+	defer C.free(unsafe.Pointer(cKeyLabel))
 
 	// --- Step 7: Provision Keychain Identity via Cgo ---
 	log.Println("Step 7: Provisioning Keychain identity with the certificate...")
@@ -233,21 +290,99 @@ func main() {
 	cCertDER := (*C.uchar)(unsafe.Pointer(&signedCertDER[0]))
 	cCertLen := C.size_t(len(signedCertDER))
 
-	ret = C.ProvisionIdentityWithCertificate(cKeyLabel, cCertDER, cCertLen)
+	ret := C.ProvisionIdentityWithCertificate(cKeyLabel, cCertDER, cCertLen)
 	if ret != C.SE_SUCCESS {
-		log.Fatalf("Error provisioning identity: %v", cErrorMap[ret])
+		return fmt.Errorf("error provisioning identity: %w", cErrorToGoError(ret))
 	}
 
-	log.Println("--- SUCCESS ---")
-	log.Printf("Keychain identity provisioned with label: %s", keyLabel)
-	log.Println("You should now be able to see this identity in Keychain Access.")
-	log.Println("Applications like Chrome/Safari should be able to use it for mTLS if prompted by a server.")
-	log.Println("Note: Biometric confirmation (Touch ID/Face ID) will likely be required each time the key is used for signing.")
+	return nil
 }
 
-// Helper function to calculate SHA256 hash
-func calculateSHA256(data []byte) []byte {
-	hasher := sha256.New()
-	hasher.Write(data)
-	return hasher.Sum(nil)
+// Convert C error code to Go error
+func cErrorToGoError(status C.int) error {
+	switch status {
+	case C.SE_SUCCESS:
+		return nil
+	case C.SE_ERR_INVALID_INPUT:
+		return errors.New("seidentity: invalid input parameters")
+	case C.SE_ERR_ACCESS_CONTROL:
+		return errors.New("seidentity: failed to create access control")
+	case C.SE_ERR_KEY_GENERATION:
+		return errors.New("seidentity: key pair generation failed")
+	case C.SE_ERR_PUBKEY_EXPORT:
+		return errors.New("seidentity: public key export failed")
+	case C.SE_ERR_KEY_NOT_FOUND:
+		return errors.New("seidentity: key not found")
+	case C.SE_ERR_AUTH_FAILED:
+		return errors.New("seidentity: user authentication failed or cancelled")
+	case C.SE_ERR_KEY_QUERY_FAILED:
+		return errors.New("seidentity: querying keychain failed")
+	case C.SE_ERR_SIGNATURE_FAILED:
+		return errors.New("seidentity: signing operation failed")
+	case C.SE_ERR_CERT_CREATE_FAILED:
+		return errors.New("seidentity: failed to create certificate object")
+	case C.SE_ERR_CERT_ADD_FAILED:
+		return errors.New("seidentity: failed to add certificate to keychain")
+	case C.SE_ERR_UNKNOWN:
+		return errors.New("seidentity: unknown error (check logs)")
+	default:
+		return fmt.Errorf("seidentity: unexpected status code: %d", status)
+	}
+}
+
+// KeyInfo holds the label and tag for a Secure Enclave key.
+type KeyInfo struct {
+	Label string
+	Tag   []byte
+}
+
+// ListSecureEnclaveKeyInfos retrieves the label and tag of all keys provisioned
+// in the Secure Enclave by this application matching the query criteria.
+func ListSecureEnclaveKeyInfos() ([]KeyInfo, error) {
+	var cKeyInfos *C.SEKeyInfo
+	var cCount C.int
+
+	status := C.ListSEKeyInfos(&cKeyInfos, &cCount)
+	err := cErrorToGoError(status)
+	if err != nil {
+		// Assume C.ListSEKeyInfos cleans up if it returns an error status.
+		return nil, fmt.Errorf("failed to list SE key infos: %w", err)
+	}
+
+	// Ensure the C memory is freed.
+	if cKeyInfos != nil {
+		defer C.FreeSEKeyInfoList(cKeyInfos, cCount)
+	}
+
+	if cCount == 0 {
+		return []KeyInfo{}, nil // Return empty slice, not nil
+	}
+
+	// Convert C array of structs to Go slice of structs
+	goKeyInfos := make([]KeyInfo, 0, int(cCount))
+
+	// Create a Go slice header backed by the C array data
+	cKeyInfoSlice := (*[1 << 30]C.SEKeyInfo)(unsafe.Pointer(cKeyInfos))[:cCount:cCount]
+
+	for i := 0; i < int(cCount); i++ {
+		info := KeyInfo{}
+		if cKeyInfoSlice[i].label != nil {
+			info.Label = C.GoString(cKeyInfoSlice[i].label)
+		}
+		if cKeyInfoSlice[i].tagData != nil && cKeyInfoSlice[i].tagLength > 0 {
+			// Use C.GoBytes to copy the tag data
+			info.Tag = C.GoBytes(cKeyInfoSlice[i].tagData, C.int(cKeyInfoSlice[i].tagLength))
+		}
+		goKeyInfos = append(goKeyInfos, info)
+	}
+
+	return goKeyInfos, nil
+}
+
+// Helper function to find minimum of two ints
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
