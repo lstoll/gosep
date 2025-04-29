@@ -18,6 +18,7 @@ var cli struct {
 	ListIdentities    ListIdentitiesCmd    `cmd:"" help:"List identities stored in the Keychain."`
 	ListKeys          ListKeysCmd          `cmd:"" help:"List keys stored in the Secure Enclave."`
 	MTLSConnect       MTLSConnectCmd       `cmd:"" help:"Connect to a remote host using mTLS with a keychain identity."`
+	BenchSign         BenchSignCmd         `cmd:"" help:"Benchmark signing operations using a Secure Enclave identity."`
 }
 
 // --- Main Function ---
